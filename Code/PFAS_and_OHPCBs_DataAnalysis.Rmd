@@ -1,0 +1,3225 @@
+---
+title: "PFAS and OH-PCBs - Data analysis"
+author: "Aina Vaivade"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    fig_caption: yes
+params:
+  resultDir: '/Users/ainva234/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/'
+  emisColestVisit: '/Users/ainva234/Documents/Project/EIMS/Data/EIMS_closest_visit.csv'
+  eimsSMSReg: '/Users/ainva234/Documents/Project/EIMS/Data/SMSRegData/EIMS_Criteria_smsreg_incl_drugs.csv'
+  dataDir: '/Users/ainva234/Documents/Project/EIMS/Data/'
+  funcFile: '/Users/ainva234/Documents/Project/EIMS/Code/functions.R'
+  samplingData: '/Users/ainva234/Documents/Project/EIMS/Data/EIMS_collection.xlsx'
+  lifeStyle: "~/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_LifestyleExposures.txt"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warnings = FALSE,
+                      message = FALSE)
+```
+
+```{r Libraries, echo = FALSE}
+library(readxl)
+library(ggpubr)
+library(lme4)
+library(car)
+library(rstatix) ?
+library(lubridate)
+library(emmeans)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(ggplotify)
+library(gridExtra)
+library(survival)
+library(survminer) 
+library(ComplexHeatmap)
+library(devtools)
+library(sjPlot)
+library(mice)
+library(brms)
+library(ggmap)
+library(Hmisc)
+library(DescTools)?
+library(ggnewscale)
+library(limma)
+library(scales)
+
+devtools::install_github("reinholdsson/swemaps", dependencies = TRUE)
+library(swemaps)
+```
+
+```{r Load data}
+source(params$funcFile)
+
+load(paste0(params$dataDir, "Environmental/Targeted/PFAS/dt.pfas.20cov.RData"))
+dt.closest.visit <- read.csv(params$emisColestVisit)
+eims.metadata <- read.csv(paste0(params$dataDir, "collated_eims_metadata.csv"))
+eims.smsreg.key <- read_excel(paste0(params$dataDir, "SMS_reg_inclEIMS.xlsx"))
+smsReg <- read.csv(params$eimsSMSReg)
+compound.info <- read_excel(paste0(params$dataDir, 'Environmental/ENV_TARGETED_COMPOUNDS_INFO.xlsx'))
+runorder <- read_excel(paste0(params$dataDir, "Environmental/FinalRunOrderEIMS_Enviro2022.xlsx"), sheet = "Runorder")
+dt.sampling <- read_excel(params$samplingData)
+dt.lifeStyle <- read.csv(params$lifeStyle, sep = "\t")
+dt.children <- read_excel("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20240419/children.xls")
+snp.data <- read_excel(paste0(params$dataDir, "SNP/Burman_MSrisk_230205.xlsx"))
+
+dt.pfas <- dt.cov
+```
+
+# Compound coverage prior to imputation 
+```{r coverage prior to imputation}
+coverage <- matrix(NA, nrow = 20, ncol = 5)
+rownames(coverage) <- colnames(dt.pfas)[1:20]
+colnames(coverage) <- c("% tot", "% HC", "% RRMS", "% SPMS", "% PPMS")
+
+dt.pfas.imp <- dt.pfas
+dt.pfas.imp[,1:20] <- 2^dt.pfas.imp[,1:20]
+
+for(i in 1:20){
+  if(length(which(dt.pfas.imp[,i] < 0)) > 0){
+    dt.pfas.imp[which(dt.pfas.imp[,i] < 0),i] <- NA
+  }
+  coverage[i,] <- c(length(which(!is.na(dt.pfas.imp[,i])))/nrow(dt.pfas.imp)*100,
+                    length(which(!is.na(dt.pfas.imp[which(dt.pfas.imp$Type == "HC"),i])))/nrow(dt.pfas.imp[which(dt.pfas.imp$Type == "HC"),])*100,
+                    length(which(!is.na(dt.pfas.imp[which(dt.pfas.imp$Type == "RR"),i])))/nrow(dt.pfas.imp[which(dt.pfas.imp$Type == "RR"),])*100,
+                    length(which(!is.na(dt.pfas.imp[which(dt.pfas.imp$Type == "SP"),i])))/nrow(dt.pfas.imp[which(dt.pfas.imp$Type == "SP"),])*100,
+                    length(which(!is.na(dt.pfas.imp[which(dt.pfas.imp$Type == "PP"),i])))/nrow(dt.pfas.imp[which(dt.pfas.imp$Type == "PP"),])*100)
+}
+
+write.csv(coverage, file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/coverage.csv")
+```
+
+# Imputing missing values with half the lowest measured concentration
+```{r Impute NA or negative values}
+dt.pfas.imp <- dt.pfas
+dt.pfas.imp[,1:20] <- 2^dt.pfas.imp[,1:20]
+
+for(i in 1:20){
+  if(length(which(dt.pfas.imp[,i] < 0)) > 0){
+    dt.pfas.imp[which(dt.pfas.imp[,i] < 0),i] <- NA
+  }
+  low.val <- min(dt.pfas.imp[,i], na.rm=T)
+  dt.pfas.imp[which(is.na(dt.pfas.imp[,i])),i] <- low.val/2
+  dt.pfas.imp[,i] <- log(dt.pfas.imp[,i], base = 2)
+}
+
+dt.pfas <- dt.pfas.imp
+```
+
+# Include Lifestyle data
+  - Reegular smoking
+  - Passive smoking
+  - Irregular smoking
+  - Swedish snuff
+  - Treatment
+  - Mono infection
+  - Alcohol consumption
+  - Number of biological children
+
+```{r lifestyle data}
+dt.pfas$Sex <- as.factor(dt.pfas$Sex)
+
+# Patients in the span of 15 to 25 years are assumed to have the same BMI at 20 as the current BMI and vice versa
+dt.pfas$BMI_20[which(dt.pfas$Age %in% c(15:25) & is.na(dt.pfas$BMI_20))] <- dt.pfas$BMI_curr[which(dt.pfas$Age %in% c(15:25) & is.na(dt.pfas$BMI_20))]
+dt.pfas$BMI_curr[which(dt.pfas$Age %in% c(15:25) & is.na(dt.pfas$BMI_curr))] <- dt.pfas$BMI_20[which(dt.pfas$Age %in% c(15:25) & is.na(dt.pfas$BMI_curr))]
+
+dt.pfas$collection.year <- NA
+
+for(i in rownames(dt.pfas)){
+  dt.pfas$collection.year[which(rownames(dt.pfas) == i)] <- format(as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == i)])]), "%Y")
+}
+
+# Include regular smoking
+dt.lifestyle <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_LifestyleExposures.csv", sep = ";")
+dt.smoking <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_regularSmoke.csv", sep = ";")
+
+dt.pfas$reg.smoking <- NA
+dt.pfas$years.reg.smoking <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$neverSmoke[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$reg.smoking[i] <- NA
+      dt.pfas$years.reg.smoking[i] <- NA
+  }else if(dt.lifestyle$neverSmoke[which(dt.lifestyle$EIMS == eims.id)] == 2){ #Never smoked
+      dt.pfas$reg.smoking[i] <- 0
+      dt.pfas$years.reg.smoking[i] <- 0
+  }else{ #Smoker or has been
+      dt.pfas$reg.smoking[i] <- 1
+      smoking <- dt.smoking[which(dt.smoking$EIMS == eims.id),]  
+      if(nrow(smoking) == 1){
+          if(is.na(smoking$toAge)){ # If NA -> not smoking and no data regarding smoking
+              dt.pfas$years.reg.smoking[i] <- NA
+          }else if(smoking$toAge >= dt.pfas$Age[i]){ # Smoking at sample timepoint, add sum of year smoking
+              dt.pfas$years.reg.smoking[i] <- as.numeric(smoking$toAge ) - as.numeric(smoking$fromAge)
+          }else{ # Not smoking at sample timepoint, but has been a regular smoker -> set number of smoking years to 0
+              dt.pfas$reg.smoking[i] <- 0
+              dt.pfas$years.reg.smoking[i] <- 0
+          }
+    }else{
+      last.smoked <- max(as.numeric(smoking$toAge), na.rm =T)
+      if(last.smoked >= dt.pfas$Age[i]){ # Smoking at sample timepoint, add sum of year smoking
+          sum.years <- 0
+          for(j in 1:nrow(smoking)){
+              sum.years <- sum.years + (as.numeric(smoking$toAge[j]) - as.numeric(smoking$fromAge[j]))
+          }    
+          dt.pfas$years.reg.smoking[i] <- sum.years
+      }else{ # Not smoking at sample timepoint, but has been a regular smoker -> set number of smoking years to 0
+          dt.pfas$reg.smoking[i] <- 0
+          dt.pfas$years.reg.smoking[i] <- 0
+       }
+     }
+  }
+}
+
+dt.pfas$reg.smoking <- as.factor(dt.pfas$reg.smoking)
+rm(dt.smoking)
+
+# Include irregular smoking
+dt.smoking <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_irregSmoke.csv", sep = ";")
+
+dt.pfas$irreg.smoking <- NA
+dt.pfas$years.irreg.smoking <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  smoking <- dt.smoking[which(dt.smoking$EIMS == eims.id),]  
+  if(nrow(smoking) == 1){
+      if(is.na(smoking$toAge)){ # If NA -> not smoking and no data regarding smoking
+          dt.pfas$irreg.smoking[i] <- 0
+          dt.pfas$years.irreg.smoking[i] <- 0
+      }else if(smoking$toAge >= dt.pfas$Age[i]){ # Smoking at sample timepoint, add sum of year smoking
+          dt.pfas$irreg.smoking[i] <- 1
+          dt.pfas$years.irreg.smoking[i] <- as.numeric(smoking$toAge ) - as.numeric(smoking$fromAge)
+      }else{ # Not smoking at sample timepoint, but has been a regular smoker -> set number of smoking years to 0
+          dt.pfas$irreg.smoking[i] <- 0
+          dt.pfas$years.irreg.smoking[i] <- 0
+      }
+ }else{
+      last.smoked <- max(as.numeric(smoking$toAge), na.rm =T)
+      if(last.smoked >= dt.pfas$Age[i]){ # Smoking at sample timepoint, add sum of year smoking
+          dt.pfas$irreg.smoking[i] <- 1
+          sum.years <- 0
+          for(j in 1:nrow(smoking)){
+              sum.years <- sum.years + (as.numeric(smoking$toAge[j]) - as.numeric(smoking$fromAge[j]))
+          }    
+          dt.pfas$years.irreg.smoking[i] <- sum.years
+      }else{ # Not smoking at sample timepoint, but has been a regular smoker -> set number of smoking years to 0
+          dt.pfas$irreg.smoking[i] <- 0
+          dt.pfas$years.irreg.smoking[i] <- 0
+      }
+ }
+} 
+
+dt.pfas$irreg.smoking <- as.factor(dt.pfas$irreg.smoking)
+rm(dt.smoking)
+
+# Include passive smoking (sum work and home)
+dt.passive.home <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_passSmokeHome.csv", sep = ";")
+dt.passive.work <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_passSmokeWork.csv", sep = ";")
+
+dt.pfas$passive.smoking.home <- NA
+dt.pfas$passive.smoking.work <- NA
+dt.pfas$years.passive.smoking <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas)[i])]
+    
+  # passive smoking in the home environment 
+  fromYear.home <- NA
+  toYear.home <- NA  
+  if(is.na(dt.lifestyle$passSmokeHome[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$passive.smoking.home[i] <- NA
+  }else if(dt.lifestyle$passSmokeHome[which(dt.lifestyle$EIMS == eims.id)] == 1){
+     dt.pfas$passive.smoking.home[i] <- 0 
+  }else{
+      smoking <- dt.passive.home[which(dt.passive.home$EIMS == eims.id),]
+      if(nrow(smoking) == 1){
+          if(is.na(smoking$toYear)){
+              dt.pfas$passive.smoking.home[i] <- 1
+          }else if(smoking$toYear >= dt.pfas$collection.year[i]){ # Smoking at sample timepoint, add sum of year smoking
+              dt.pfas$passive.smoking.home[i] <- 1
+              fromYear.home <- smoking$fromYear
+              toYear.home <- smoking$toYear
+          }else{ # Not smoking at sample timepoint, but has been a regular smoker -> set number of smoking years to 0
+              dt.pfas$passive.smoking.home[i] <- 0
+          }
+     }else{
+        last.smoked <- max(as.numeric(smoking$toYear), na.rm =T)
+        if(last.smoked >= dt.pfas$collection.year[i]){ # Smoking at sample timepoint, add sum of year smoking
+          dt.pfas$passive.smoking.home[i] <- 1
+          sum.years <- 0
+          for(j in 1:nrow(smoking)){
+              sum.years <- sum.years + (as.numeric(smoking$toYear[j]) - as.numeric(smoking$fromYear[j]))
+          }    
+          fromYear.home <- min(unlist(lapply(smoking$fromYear, function(x) as.numeric(x))), na.rm=T)
+          toYear.home <- max(unlist(lapply(smoking$toYear, function(x) as.numeric(x))), na.rm=T)  
+        }else{ # Not smoking at sample timepoint, but has been a regular smoker -> set number of smoking years to 0
+          dt.pfas$passive.smoking.home[i] <- 0  
+        }
+     }
+  }
+
+  # Passive smoking in the working environment
+  fromYear.work <- NA
+  toYear.work <- NA    
+  if(is.na(dt.lifestyle$passSmokeWork[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$passive.smoking.work[i] <- NA
+  }else if(dt.lifestyle$passSmokeWork[which(dt.lifestyle$EIMS == eims.id)] == 1){
+     dt.pfas$passive.smoking.work[i] <- 0   
+  }else{
+      smoking <- dt.passive.work[which(dt.passive.work$EIMS == eims.id),]
+      if(nrow(smoking) == 1){
+          if(is.na(smoking$toYear)){
+              dt.pfas$passive.smoking.work[i] <- 1
+          }else if(smoking$toYear >= dt.pfas$collection.year[i]){ # Smoking at sample timepoint, add sum of year smoking
+              dt.pfas$passive.smoking.work[i] <- 1
+              fromYear.work <- smoking$fromYear
+              toYear.work <- smoking$toYear
+          }else{ # Not smoking at sample timepoint, but has been a regular smoker -> set number of smoking years to 0
+              dt.pfas$passive.smoking.work[i] <- 0
+          }
+     }else{
+        last.smoked <- max(as.numeric(smoking$toYear), na.rm =T)
+        if(last.smoked >= dt.pfas$collection.year[i]){ # Smoking at sample timepoint, add sum of year smoking
+          dt.pfas$passive.smoking.work[i] <- 1
+          sum.years <- 0
+          for(j in 1:nrow(smoking)){
+              sum.years <- sum.years + (as.numeric(smoking$toYear[j]) - as.numeric(smoking$fromYear[j]))
+          }    
+          fromYear.work <- min(unlist(lapply(smoking$fromYear, function(x) as.numeric(x))), na.rm=T)
+          toYear.work <- max(unlist(lapply(smoking$toYear, function(x) as.numeric(x))), na.rm=T)   
+        }else{ # Not smoking at sample timepoint, but has been a regular smoker -> set number of smoking years to 0
+          dt.pfas$passive.smoking.work[i] <- 0  
+        }
+     }
+  }
+
+  # Sum years of passive smoking
+  if((is.na(fromYear.home) | is.na(toYear.home)) & (is.na(fromYear.work) | is.na(toYear.work))){
+      dt.pfas$years.passive.smoking[i] <- NA
+  }else{
+     dt.pfas$years.passive.smoking[i] <- max(c(toYear.home, toYear.work), na.rm=T) - min(c(fromYear.home, fromYear.work), na.rm=T) 
+  }       
+}
+
+for(i in 1:nrow(dt.pfas)){
+    if(is.na(dt.pfas$years.passive.smoking[i])){
+        if(!is.na(dt.pfas$passive.smoking.work[i]) | !is.na(dt.pfas$passive.smoking.work[i])){
+            dt.pfas$years.passive.smoking[i] <- 0
+        }
+    }
+}
+
+dt.pfas$passive.smoking <- NA
+for(i in 1:nrow(dt.pfas)){
+  if(is.na(dt.pfas$passive.smoking.work[i])){
+    dt.pfas$passive.smoking[i] <- dt.pfas$passive.smoking.home[i]
+  }else if(!is.na(dt.pfas$passive.smoking.work[i]) & !is.na(dt.pfas$passive.smoking.home[i])){
+    if(dt.pfas$passive.smoking.home[i] == 0 & dt.pfas$passive.smoking.work[i] != 1){
+      dt.pfas$passive.smoking[i] <- 0
+    }else if(dt.pfas$passive.smoking.home[i] == 1){
+      dt.pfas$passive.smoking[i] <- 1
+    }
+  }
+  
+  if(is.na(dt.pfas$passive.smoking.home[i])){
+    dt.pfas$passive.smoking[i] <- dt.pfas$passive.smoking.work[i]
+  } else if(!is.na(dt.pfas$passive.smoking.home[i]) & !is.na(dt.pfas$passive.smoking.work[i])){
+      if(dt.pfas$passive.smoking.work[i] == 0 & dt.pfas$passive.smoking.home[i] != 1){
+        dt.pfas$passive.smoking[i] <- 0
+      }else if(dt.pfas$passive.smoking.work[i] == 1){
+        dt.pfas$passive.smoking[i] <- 1
+      }
+    }
+  
+}
+dt.pfas$passive.smoking <- as.factor(dt.pfas$passive.smoking)
+rm(dt.passive.home, dt.passive.work)
+
+# Include Swedish snuff
+dt.snus <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_Snus.csv", sep = ";")
+
+dt.pfas$snuff <- NA
+dt.pfas$years.snuff <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$Snus[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$snuff[i] <- NA
+      dt.pfas$years.snuff[i] <- NA
+  }else if(dt.lifestyle$Snus[which(dt.lifestyle$EIMS == eims.id)] == 1){
+      dt.pfas$snuff[i] <- 0
+      dt.pfas$years.snuff[i] <- 0
+  }else{ 
+      dt.pfas$snuff[i] <- 1
+      snus <- dt.snus[which(dt.snus$EIMS == eims.id),]  
+      if(nrow(snus) == 1){
+          if(is.na(snus$toAge)){ 
+              dt.pfas$years.snuff[i] <- NA
+          }else if(snus$toAge >= dt.pfas$Age[i]){ 
+              dt.pfas$years.snuff[i] <- as.numeric(snus$toAge ) - as.numeric(snus$fromAge)
+          }else{
+              dt.pfas$snuff[i] <- 0
+              dt.pfas$years.snuff[i] <- 0
+          }
+    }else{
+      last.snus <- max(as.numeric(snus$toAge), na.rm =T)
+      if(last.snus >= dt.pfas$Age[i]){ 
+          sum.years <- 0
+          for(j in 1:nrow(snus)){
+              sum.years <- sum.years + (as.numeric(snus$toAge[j]) - as.numeric(snus$fromAge[j]))
+          }    
+          dt.pfas$years.snuff[i] <- sum.years
+      }else{ 
+          dt.pfas$snuff[i] <- 0
+          dt.pfas$years.snuff[i] <- 0
+       }
+     }
+  }
+}                    
+
+dt.pfas$snuff <- as.factor(dt.pfas$snuff)
+rm(dt.snus)
+
+# Include tratment
+dt.drugs <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/SMSRegData/terapi.csv", sep=";")
+drug.classification <- read_excel("/Users/ainva234/Documents/Project/EIMS/Data/SMSRegData/drug_classification_V2.xlsx")
+
+# Add drug classification type
+drug.classification$Type <- NA
+drug.classification$Type[which(drug.classification$relapse_treatment_drugs == 1)] <- "Other drugs"
+drug.classification$Type[which(drug.classification$first_line_DMT == 1)] <- "First line DMT"
+drug.classification$Type[which(drug.classification$second_line_DMT == 1)] <- "Second line DMT"
+drug.classification$Type[which(drug.classification$other_drugs == 1)] <- "Other drugs"
+drug.classification$Type[which(drug.classification$stem_cell_treatment == 1)] <- "Stem cell treatment"
+
+# Replace dates that ends with 00 to 01
+dt.drugs$utsatt[grep("-00", dt.drugs$utsatt)] <- gsub("-00", "-01", dt.drugs$utsatt[grep("-00", dt.drugs$utsatt)])
+
+dt.pfas$treatment <- "No treatment"
+
+temp <- dt.drugs
+eims.smsReg.id <- unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2]))
+temp <- dt.drugs[which(dt.drugs$patientkod %in% eims.smsReg.id),]
+
+for(i in 1:nrow(dt.pfas)){
+    if(dt.pfas$Type[i] == "HC"){
+        dt.pfas$treatment[i] <- "No treatment"
+    }else{
+        eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+        smsReg.id <- strsplit(eims.smsreg.key$Register.Id[which(eims.smsreg.key$EIMS_1 == eims.id)], "SMS")[[1]][2]
+        samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+
+        treatments <- temp[which(temp$patientkod == smsReg.id),]
+        treatments[treatments == ""] <- NA
+        if(nrow(treatments) == 0){
+            dt.pfas$treatment[i] <- "No treatment"
+        }else{
+            for(j in 1:nrow(treatments)){
+                if(is.na(treatments$utsatt[j]) & as.Date(treatments$insatt[j]) < samp.time){
+                    if(treatments$preparat[j] == "Ingen behandling"){
+                        dt.pfas$treatment[i] <- "No treatment"
+                    }else{
+                        dt.pfas$treatment[i] <- drug.classification$Type[which(drug.classification$drugs == treatments$preparat[j])]
+                    }
+                    j <- nrow(treatments)
+                }else if(is.na(treatments$utsatt[j]) & as.Date(treatments$insatt[j]) > samp.time){
+                    dt.pfas$treatment[i] <- NA
+                }else if(as.Date(treatments$utsatt[j]) > samp.time & as.Date(treatments$insatt[j]) < samp.time){
+                    if(treatments$preparat[j] == "Ingen behandling"){
+                        dt.pfas$treatment[i] <- "No treatment"
+                    }else{
+                        dt.pfas$treatment[i] <- drug.classification$Type[which(drug.classification$drugs == treatments$preparat[j])]
+                    }
+                    j <- nrow(treatments)
+                }
+            }
+        }
+    }
+}
+
+dt.pfas$treatment[which(is.na(dt.pfas$treatment))] <- "No treatment"
+
+dt.pfas$treatment <- relevel(as.factor(dt.pfas$treatment), ref = "No treatment")
+
+# History of infectious mononucleosis
+dt.pfas$mono <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$infMono[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$mono[i] <- NA
+  }else if(dt.lifestyle$infMono[which(dt.lifestyle$EIMS == eims.id)] == 1){
+      dt.pfas$mono[i] <- 0
+  }else{ 
+      dt.pfas$mono[i] <- 1
+  }
+} 
+dt.pfas$mono <- as.factor(dt.pfas$mono)
+
+# Volume (cl) alcohol consumed the week prior to sample collection
+dt.pfas$cl.alcohol <- NA
+
+dt.lifestyle$alcoholBeerQuant <- dt.lifestyle$alcoholBeerQuant*0.035/40 # Recalculate volume beer to volume (cl) 40% alcohol
+dt.lifestyle$alcoholWineQuant <- dt.lifestyle$alcoholWineQuant*0.12/40 # Recalculate volume wine to volume (cl) 40% alcohol
+dt.lifestyle$alcoholStrongWineQuant <- dt.lifestyle$alcoholStrongWineQuant*0.15/40 # Recalculate volume strong wine to volume (cl) 40% alcohol
+dt.lifestyle$alcoholLiquorQuant <- dt.lifestyle$alcoholLiquorQuant
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$alcohol12Months[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$cl.alcohol[i] <- NA
+  }else if(dt.lifestyle$alcohol12Months[which(dt.lifestyle$EIMS == eims.id)] == 1){
+      dt.pfas$cl.alcohol[i] <- 0
+  }else{ 
+      dt.pfas$cl.alcohol[i] <- sum(dt.lifestyle[which(dt.lifestyle$EIMS == eims.id),c(30:33)], na.rm=T) 
+  }
+} 
+
+# Number of biological children
+dt.pfas$nr.children <- NA
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  dt.pfas$nr.children[i] <- dt.children$antalbarn[which(dt.children$EIMS == eims.id)]
+} 
+dt.pfas$nr.children[which(dt.pfas$Sex == 0)] <- 0
+dt.pfas$nr.children[which(is.na(dt.pfas$nr.children))] <- 0
+
+# Percentage body fat
+## Percentage body fat (%BF) estimate using the formula presented by Deurenberg P, et al, 1991 which uses age, sex, and BMI
+## BF% = 1.20 x BMI+0.23 x age- 10.8 x sex-54
+## For this formula males = 1 and females  = 0
+dt.pfas$perc.body.fat.curr <- NA
+dt.pfas$perc.body.fat.20 <- NA
+for(i in 1:nrow(dt.pfas)){
+  if(dt.pfas$Sex[i] == 0){ #Males
+    dt.pfas$perc.body.fat.curr[i] <- 1.20*dt.pfas$BMI_curr[i]+0.23*dt.pfas$Age[i]-10.8*1-5.4
+    dt.pfas$perc.body.fat.20[i] <- 1.20*dt.pfas$BMI_20[i]+0.23*20-10.8*1-5.4
+  }else{ #Females
+    dt.pfas$perc.body.fat.curr[i] <- 1.20*dt.pfas$BMI_curr[i]+0.23*dt.pfas$Age[i]-10.8*0-5.4
+    dt.pfas$perc.body.fat.20[i] <- 1.20*dt.pfas$BMI_20[i]+0.23*20-10.8*0-5.4
+  }
+  
+} 
+
+# Born in Sweden and other nordic countries
+born.country <- read_excel("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/Ancestry.xls")
+dt.pfas$Swedish <- NA
+dt.pfas$Nordic <- NA
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas)[i])]
+  dt.pfas$Swedish[i] <- born.country$swedish[which(born.country$EIMS == eims.id)]
+  dt.pfas$Nordic[i] <- born.country$nordic[which(born.country$EIMS == eims.id)]
+}
+dt.pfas$Swedish <- as.factor(dt.pfas$Swedish)
+dt.pfas$Nordic <- as.factor(dt.pfas$Nordic)
+```
+
+# Covariate analysis
+## Collection year
+```{r Sample collection year vs compound concentration}
+plot_list <- list()
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Sex <- as.character(temp$Sex)
+  temp$Sex[temp$Sex == "0"] <- "Male"
+  temp$Sex[temp$Sex == "1"] <- "Female"
+  temp$Sex <- as.factor(temp$Sex)
+  temp$collection.year <- as.factor(temp$collection.year)
+  temp$imputed <- "Measured"
+  temp$imputed[which(temp$envCont == min(temp$envCont))] <- "Imputed"
+  temp$imputed <- as.factor(temp$imputed)
+  temp$NewType <- NA
+  temp$NewType[which(temp$Sex == "Male" & temp$Type == "HC")] <- "Male, HC"
+  temp$NewType[which(temp$Sex == "Female" & temp$Type == "HC")] <- "Female, HC"
+  temp$NewType[which(temp$Sex == "Male" & temp$Type %in% c("RR", "SP", "PP"))] <- "Male, MS"
+  temp$NewType[which(temp$Sex == "Female" & temp$Type %in% c("RR", "SP", "PP"))] <- "Female, MS"
+  
+  plot_list[[e]] <- ggplot(temp, aes(x = collection.year, y = envCont, shape = NewType, color = imputed)) + 
+    geom_boxplot(outlier.shape=NA, aes(x = collection.year, y = envCont, shape = Sex)) +
+    geom_point(position=position_jitterdodge()) +
+    scale_color_manual(labels = c("Imputed", "Measured"), values = c("Imputed" = "gray", "Measured" = "black"), guide = "none") +
+    scale_shape_manual(values=c("Male, HC" = 2, "Male, MS" = 17, "Female, HC" = 1, "Female, MS" = 19),
+                       labels = c("Female, HC", "Female, MS", "Male, HC", "Male, MS"),
+                       name = "Sex and Type") + 
+    new_scale_color() +
+    geom_smooth(data = as.data.frame(temp[which(temp$imputed == "Measured"),]), method = "loess", 
+                aes(x = collection.year, y = envCont, color = Sex, group = Sex, linetype = Sex), se = T) +
+    scale_color_manual(labels = c("Female", "Male"), 
+                       values = c("Male" = "#0778DC", "Female" = "#C90D96"),
+                       name = "Sex") + 
+    scale_linetype_manual(values=c("Male" = "solid", "Female" = "twodash"),
+                          name = "Sex") + 
+    theme_classic() + 
+    theme(legend.position = "top", 
+          legend.box="vertical", 
+          legend.margin=margin(),
+          title = element_text(size =10, family = "sans"), 
+          axis.text = element_text(size = 10, family = "sans"), 
+          axis.title.y = element_text(size = 10, family = "sans"), 
+          axis.title.x = element_blank(),
+          legend.text = element_text(size = 10, family = "sans"),
+          axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5)) +
+    ylab(expression("Log"[2]~"Conc. (ng/mL)")) + 
+    labs(title = envCont.name) + 
+    scale_x_discrete(labels = c(2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015)) 
+}
+
+#Manuscript figure 1
+ggsave(ggarrange(plotlist = plot_list[c(5:7,18)], ncol = 2, nrow = 2, labels = "AUTO", common.legend = T, font.label = list(size = 14, color = "black", family = "sans")), 
+       file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/CollectionYear/Manuscirpt_Figure_1.10.01.25.pdf", 
+       height =185, width = 180, units = "mm", dpi = 300)
+
+#Supplementary figure 
+ggsave(ggarrange(plotlist = plot_list[c(1:4,8:17,19:20)], ncol = 3, nrow = 6, labels = "AUTO", common.legend = T, font.label = list(size = 14, color = "black", family = "sans")), 
+       file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/CollectionYear/suppleMaterials_Figure_S1.10.01.25.pdf", 
+       height =20, width = 15, dpi = 300)
+```
+
+## Age
+```{r Age vs compound concentration}
+plot_list <- list()
+for(i in 1:20){
+  e = colnames(dt.pfas)[i]
+  cols <- append(c(e), c("Type", "Age",  "Sex", "pairID", "County"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Sex <- as.character(temp$Sex)
+  temp$Sex[temp$Sex == "0"] <- "Male"
+  temp$Sex[temp$Sex == "1"] <- "Female"
+  temp$Sex <- as.factor(temp$Sex)
+  temp$imputed <- "Measured"
+  temp$imputed[which(temp$envCont == min(temp$envCont))] <- "Imputed"
+  temp$imputed <- as.factor(temp$imputed)
+  temp$NewType <- NA
+  temp$NewType[which(temp$Sex == "Male" & temp$Type == "HC")] <- "Male, HC"
+  temp$NewType[which(temp$Sex == "Female" & temp$Type == "HC")] <- "Female, HC"
+  temp$NewType[which(temp$Sex == "Male" & temp$Type %in% c("RR", "SP", "PP"))] <- "Male, MS"
+  temp$NewType[which(temp$Sex == "Female" & temp$Type %in% c("RR", "SP", "PP"))] <- "Female, MS"
+  
+  plot_list[[i]] <- ggplot(temp, aes(x = Age, y = envCont, shape = NewType, color = imputed)) + 
+    geom_point() + 
+    scale_color_manual(labels = c("Imputed", "Measured"), values = c("Imputed" = "gray", "Measured" = "black"), guide = "none") +
+    scale_shape_manual(values=c("Male, HC" = 2, "Male, MS" = 17, "Female, HC" = 1, "Female, MS" = 19),
+                       labels = c("Female, HC", "Female, MS", "Male, HC", "Male, MS"),
+                       name = "Sex and Type") + 
+    new_scale_color() + 
+    geom_smooth(data = as.data.frame(temp[which(temp$imputed == "Measured"),]), method = "loess", 
+                aes(x = Age, y = envCont, color = Sex, group = Sex, linetype = Sex), se = T) +
+    scale_color_manual(labels = c("Female", "Male"), 
+                       values = c("Male" = "#0778DC", "Female" = "#C90D96"),
+                       name = "Sex") + 
+    scale_linetype_manual(values=c("Male" = "solid", "Female" = "twodash"),
+                          name = "Sex") + 
+    ylab(expression("Log"[2]~"Conc. (ng/mL)")) + 
+    xlab("Age") + 
+    labs(title = e)  + 
+    theme_classic() + 
+    theme(legend.position = "top", 
+          legend.box="vertical", 
+          legend.margin=margin(),
+          title = element_text(size =10, family = "sans"), 
+          axis.text = element_text(size = 10, family = "sans"), 
+          axis.title.y = element_text(size = 10, family = "sans"), 
+          legend.text = element_text(size = 10, family = "sans")) 
+    
+}
+
+# Manuscript figure 2
+ggsave(ggarrange(plotlist = plot_list[c(5:7,18)], ncol = 2, nrow = 2, labels = "AUTO", common.legend = T, font.label = list(size = 14, color = "black", family = "sans")), 
+       file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/Age/Figure_2.pdf", 
+       height =185, width = 180, units = "mm", dpi = 300)
+
+# Supplementary figure
+ggsave(ggarrange(plotlist = plot_list[c(1:4,8:17,19:20)], ncol = 3, nrow = 6, labels = "AUTO", common.legend = T, font.label = list(size = 14, color = "black", family = "sans")), 
+       file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/Age/suppleMaterial.Figure_S2.pdf", 
+       height =20, width = 15, dpi = 300)
+```
+
+## Sex
+```{r Compound concentration differences between males and females (HC and MS grouped)}
+plot_list <- list()
+i = 1
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Type <- as.factor(temp$Type)
+  
+  mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + Week + nr.children + (1|pairID), data = na.omit(temp))
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Sex"), 
+                                 method = "pairwise", adjust = "none"))
+  
+  stats.test <- as.data.frame(matrix(NA, ncol = 5, nrow = 1))
+  colnames(stats.test) <- c("group1", "group2", "n1", "n2", "p")
+  stats.test[1,] <- c("Man", "Woman",
+                             nrow(temp[which(temp$Sex == 0),]), nrow(temp[which(temp$Sex == 1),]),
+                             signif(con$p.value, digits = 4))
+  stats.test <- stats.test %>% add_xy_position(data = temp, formula = envCont ~ Sex, x = "Sex")
+  stats.test$p <- format(signif(as.numeric(stats.test$p), digits = 3), scientific = T)
+  
+  temp$Sex <- as.character(temp$Sex)
+  temp$Sex[which(temp$Sex == "0")] <- "Male"
+  temp$Sex[which(temp$Sex == "1")] <- "Female"
+  temp$Sex <- as.factor(temp$Sex)
+  
+  bxp <- ggboxplot(temp, x = "Sex", y = "envCont",
+            color = "Sex", add = "jitter",
+            title = envCont.name) +
+    stat_pvalue_manual(stats.test, label = "p", size = 5, family = "sans")+
+    scale_color_manual(values = c("Male" = "#0778DC", "Female" = "#C90D96")) +
+    theme(axis.title.x = element_blank(), 
+          axis.text.x = element_text(size = 14, family = "sans"),
+          plot.title = element_text(size = 16, family = "sans"),
+          axis.title.y = element_text(size = 14, family = "sans"), 
+          axis.text.y = element_text(size = 14, family = "sans"),
+          legend.text = element_text(size = 14, family = "sans")) +
+    ylab(expression("Log"[2]~"Conc. (ng/mL)")) +
+    ylim(c(min(temp$envCont, na.rm = T), max(temp$envCont, na.rm=T) + 1)) +
+    scale_x_discrete(limits = c("Male", "Female"))
+
+
+  plot_list[[i]] <- bxp
+  i = i+1
+}
+
+ggsave(ggarrange(plotlist = plot_list[c(1:20)], ncol = 4, nrow = 5, labels = "AUTO", common.legend = T, font.label = list(size = 24, color = "black", family = "sans")), 
+       file = paste0(params$resultDir, "Imputed/Sex/Conc_vs_Sex/suppleMaterial.Figure_S3.pdf"),
+       width = 15,
+       height = 20,
+       units = "in",
+       dpi = 300)
+```
+
+## County
+```{r Group in larger groups}
+dt.pfas.MS <- dt.pfas[which(dt.pfas$Type != "HC"),]
+dt.assumption <- dt.pfas
+for(i in unique(dt.pfas$pairID)){
+  if(length(which(dt.pfas.MS$pairID == i)) > 0){
+   dt.assumption$County[which(dt.assumption$pairID == i)] <- dt.pfas.MS$County[which(dt.pfas.MS$pairID == i)]
+  }
+}
+
+order_county <- c("Skåne", "Blekinge", "Kronobergs", "Hallands", "Kalmar", "Jönköpings", "Gotlands", "Västra Götalands", 
+                 "Östergötalands", "Södermanlands", "Örebro", "Stockholms", "Värmlands", "Västermanlands", "Upplands", "Dalarnas", "Gävleborgs", 
+                 "Jämtlands", "Västernorrlands", "Västerbotten", "Norrbottens")
+
+dt.plot <- dt.assumption
+dt.plot$CountyLargeRegions <- NA
+dt.plot$CountyLargeRegions[which(dt.plot$County %in% c("Skåne", "Blekinge"))] <- "Region 6"
+dt.plot$CountyLargeRegions[which(dt.plot$County %in% c( "Hallands", "Västra Götalands"))] <- "Region 5"
+dt.plot$CountyLargeRegions[which(dt.plot$County %in% c("Kalmar", "Jönköpings","Kronobergs", "Östergötalands"))] <- "Region 4"
+dt.plot$CountyLargeRegions[which(dt.plot$County %in% c("Stockholms", "Gotlands"))] <- "Region 3"
+dt.plot$CountyLargeRegions[which(dt.plot$County %in% c( "Upplands", "Dalarnas", "Gävleborgs", "Örebro", "Södermanlands", "Västermanlands", "Värmlands"))] <- "Region 2"
+dt.plot$CountyLargeRegions[which(dt.plot$County %in% c("Jämtlands", "Västernorrlands", "Västerbotten", "Norrbottens"))] <- "Region 1"
+```
+
+```{r Combine boxplots with region comaprison and map in one figure}
+# Add comparison to compounds of interest
+plot_list <- list()
+p <- 1
+for(e in 1:20){
+    envCont.name <- colnames(dt.plot)[e]
+    cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "CountyLargeRegions", "collection.year", "Week", "BMI_curr", "BMI_20", "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children"))
+    temp <- dt.plot[,cols]
+    names(temp)[1] <- 'envCont'
+    temp$CountyLargeRegions <- factor(temp$CountyLargeRegions, levels = c("Region 1", "Region 2", "Region 3", "Region 4", "Region 5", "Region 6"))
+    
+    # Map
+    map_ln$regionname <- NA
+    map_ln$regionname[which(map_ln$lnnamn %in% c("Skåne län", "Blekinge län"))] <- "Region 6"
+    map_ln$regionname[which(map_ln$lnnamn %in% c("Hallands län", "Västra Götalands län"))] <- "Region 5"
+    map_ln$regionname[which(map_ln$lnnamn %in% c("Kalmar län", "Jönköpings län", "Kronobergs län", "Östergötlands län"))] <- "Region 4"
+    map_ln$regionname[which(map_ln$lnnamn %in% c("Stockholms län", "Gotlands län"))] <- "Region 3"
+    map_ln$regionname[which(map_ln$lnnamn %in% c("Uppsala län", "Dalarnas län", "Gävleborgs län", "Örebro län", "Södermanlands län", "Västmanlands län", "Värmlands län"))] <- "Region 2"
+    map_ln$regionname[which(map_ln$lnnamn %in% c("Jämtlands län", "Västernorrlands län", "Västerbottens län", "Norrbottens län"))] <- "Region 1"
+    
+    map_ln$meanPFAS <- NA
+    map_ln$meanPFAS[which(map_ln$regionname == "Region 1")] <- mean(temp$envCont[which(dt.plot$CountyLargeRegions == "Region 1")], na.rm=T)
+    map_ln$meanPFAS[which(map_ln$regionname == "Region 2")] <- mean(temp$envCont[which(dt.plot$CountyLargeRegions == "Region 2")], na.rm=T)
+    map_ln$meanPFAS[which(map_ln$regionname == "Region 3")] <- mean(temp$envCont[which(dt.plot$CountyLargeRegions == "Region 3")], na.rm=T)
+    map_ln$meanPFAS[which(map_ln$regionname == "Region 4")] <- mean(temp$envCont[which(dt.plot$CountyLargeRegions == "Region 4")], na.rm=T)
+    map_ln$meanPFAS[which(map_ln$regionname == "Region 5")] <- mean(temp$envCont[which(dt.plot$CountyLargeRegions == "Region 5")], na.rm=T)
+    map_ln$meanPFAS[which(map_ln$regionname == "Region 6")] <- mean(temp$envCont[which(dt.plot$CountyLargeRegions == "Region 6")], na.rm=T)
+    
+    map_ln$meanPFAS <- 2^map_ln$meanPFAS
+    
+    plot_list[[p]] <- ggplot() + 
+      geom_polygon(data = map_ln, aes(x=leaflet_long, y = leaflet_lat, group = group, fill = meanPFAS)) + 
+      coord_fixed(1.5) + 
+      scale_fill_gradient(low = "#C4DEF5", high = "#03325C", name = expression("Mean"~"conc (ng/mL)")) +
+      theme_void() + 
+      labs(title = envCont.name) + 
+       theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+            plot.title = element_text(size = 10), legend.title = element_text(size = 8))
+
+    p <- p+1
+    
+    # Boxplot
+    temp <- temp[-which(is.na(temp$CountyLargeRegions)),]
+    mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + Week + CountyLargeRegions + nr.children + (1|pairID), 
+                      data = na.omit(temp))
+    con <- as.data.frame(contrast(emmeans(mdl, specs = "CountyLargeRegions"), 
+                                  method = "pairwise", 
+                                  adjust = "none"))
+    
+    signif_con <- con$contrast[which(con$p.value < 0.05)]
+    if(length(signif_con)>0){
+      stat.test <- as.data.frame(matrix(NA, ncol = 5, nrow = length(signif_con)))
+      colnames(stat.test) <- c("group1", "group2", "n1", "n2", "p")
+      stat.test$group1 <- unlist(lapply(strsplit(signif_con, split = " - "), function(x) x[1]))
+      stat.test$group2 <- unlist(lapply(strsplit(signif_con, split = " - "), function(x) x[2]))
+      for(i in 1:nrow(stat.test)){
+        stat.test$n1[i] <- length(which(dt.plot$CountyLargeRegions == stat.test$group1[i]))
+        stat.test$n2[i] <- length(which(dt.plot$CountyLargeRegions == stat.test$group2[i]))
+      }
+      stat.test$p <- con[which(con$p.value<0.05),]$p.value
+      stat.test <- stat.test %>% add_significance() %>% add_xy_position(data = temp, formula = envCont ~ CountyLargeRegions, x = "CountyLargeRegions")
+      y.position <- c(min(stat.test$y.position, na.rm=T))
+      stat.test$p <- scientific(stat.test$p, digits = 3)
+      if(nrow(stat.test)>1){
+        for(j in 1:(nrow(stat.test)-1)){
+          y.position <- append(y.position, max(y.position)+0.1)
+        }
+      }
+      stat.test$y.position <- y.position
+      plot_list[[p]] <- ggboxplot(temp, x = "CountyLargeRegions", y = "envCont", 
+                  color = "CountyLargeRegions", add = "jitter",
+                  title = envCont.name) +
+          theme(axis.text.x=element_text(angle = -90, hjust = 0, size = 9), 
+                legend.position = "none", 
+                axis.title.x = element_blank(), 
+                plot.title = element_text(size = 10),
+                axis.title.y = element_text(size = 9),
+                axis.text.y=element_text(size = 8)) +
+          ylab(expression("Log"[2]~"Conc. (ng/mL)")) + 
+        stat_pvalue_manual(stat.test, label = "p", step.increase = 0.15, size = 2.7) +
+        ylim(min(temp$envCont, na.rm=T), (max(temp$envCont, na.rm=T) + nrow(stat.test)*2))
+      
+      if(e < length(selected)){
+        p <- p+1
+      }
+    }else{
+      plot_list[[p]] <- ggboxplot(temp, x = "CountyLargeRegions", y = "envCont", 
+                                  add = "jitter", color = "CountyLargeRegions",
+                  title = envCont.name) +
+          theme(axis.text.x=element_text(angle = -90, hjust = 0, size = 9), 
+                legend.position = "none", 
+                axis.title.x = element_blank(), 
+                plot.title = element_text(size = 10),
+                axis.title.y = element_text(size = 9),
+                axis.text.y=element_text(size = 8)) +
+          ylab(expression("Log"[2]~"Conc. (ng/mL)"))
+      
+      if(e < length(selected)){
+        p <- p+1
+      }
+  }
+}
+# ggsave(ggarrange(plotlist = plot_list, labels = "AUTO", ncol = 2, nrow = 1),
+#        filename = paste0(params$resultDir, "Imputed/CountyLargeRegions/manuscript.22.04.24.pdf"),
+#        height = 3, width = 8, units = "in", dpi = 300)
+
+ggsave(ggarrange(plotlist = plot_list, labels = "AUTO", ncol = 2, nrow = 3),
+       filename = paste0(params$resultDir, "Imputed/CountyLargeRegions/Supplementary.G1.22.04.24.pdf"),
+       height = 9, width = 8, units = "in", dpi = 300)
+```
+
+```{r plot general map}
+map_ln_save <- map_ln
+
+map_ln$regionname <- NA
+map_ln$regionname[which(map_ln$lnnamn %in% c("Skåne län", "Blekinge län"))] <- "Region 6"
+map_ln$regionname[which(map_ln$lnnamn %in% c("Hallands län", "Västra Götalands län"))] <- "Region 5"
+map_ln$regionname[which(map_ln$lnnamn %in% c("Kalmar län", "Jönköpings län", "Kronobergs län", "Östergötlands län"))] <- "Region 4"
+map_ln$regionname[which(map_ln$lnnamn %in% c("Stockholms län", "Gotlands län"))] <- "Region 3"
+map_ln$regionname[which(map_ln$lnnamn %in% c("Uppsala län", "Dalarnas län", "Gävleborgs län", "Örebro län", "Södermanlands län", "Västmanlands län", "Värmlands län"))] <- "Region 2"
+map_ln$regionname[which(map_ln$lnnamn %in% c("Jämtlands län", "Västernorrlands län", "Västerbottens län", "Norrbottens län"))] <- "Region 1"
+# 
+# map_ln$meanPFAS <- NA
+# map_ln$meanPFAS[which(map_ln$regionname == "Region 1")] <- mean(dt.plot$PFDA[which(dt.plot$CountLargeRegions == "Region 1")], na.rm=T)
+# map_ln$meanPFAS[which(map_ln$regionname == "Region 2")] <- mean(dt.plot$PFDA[which(dt.plot$CountLargeRegions == "Region 2")], na.rm=T)
+# map_ln$meanPFAS[which(map_ln$regionname == "Region 3")] <- mean(dt.plot$PFDA[which(dt.plot$CountLargeRegions == "Region 3")], na.rm=T)
+# map_ln$meanPFAS[which(map_ln$regionname == "Region 4")] <- mean(dt.plot$PFDA[which(dt.plot$CountLargeRegions == "Region 4")], na.rm=T)
+# map_ln$meanPFAS[which(map_ln$regionname == "Region 5")] <- mean(dt.plot$PFDA[which(dt.plot$CountLargeRegions == "Region 5")], na.rm=T)
+# map_ln$meanPFAS[which(map_ln$regionname == "Region 6")] <- mean(dt.plot$PFDA[which(dt.plot$CountLargeRegions == "Region 6")], na.rm=T)
+# 
+# map_ln$meanPFAS <- 2^map_ln$meanPFAS
+
+# General map of regions
+gg_cen <- ggplot() + 
+  geom_polygon(data = map_ln, aes(x=leaflet_long, y = leaflet_lat, group = group, fill = regionname)) + 
+  coord_fixed(1.5) + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank()) +
+  theme_void() 
+ggsave(gg_cen, file = "~/Documents/Project/EIMS/Results/Environmental/Regions.pdf")
+```
+
+## Biological children
+```{r nr children vs conc - Females}
+plot_list <- list()
+i = 1
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age","pairID", "collection.year", "BMI_curr", "BMI_20", "Week", "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children"))
+  temp <- dt.pfas[which(dt.pfas$Sex == 0),cols]
+  names(temp)[1] <- 'envCont'
+  temp$collection.year <- as.numeric(temp$collection.year)
+  for(i in 1:nrow(temp)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(temp )[i])]
+  temp$nr.children[i] <- dt.children$antalbarn[which(dt.children$EIMS == eims.id)]
+  }
+  temp$nr.children[which(is.na(temp$nr.children))] <- 0
+  temp$nr.children[which(temp$nr.children > 0)] <- 1
+  temp$nr.children <- as.factor(temp$nr.children)
+  temp$treatment <- as.factor(temp$treatment)
+  temp$Type <- as.factor(temp$Type)
+  
+   mdl <- lme4::lmer(envCont ~ Type + collection.year + Age  + BMI_curr + BMI_20 + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + Week + nr.children + (1|pairID), data = na.omit(temp))
+   con <- as.data.frame(contrast(emmeans(mdl, specs = "nr.children"), method = "pairwise", adjust = "none"))
+   print(envCont.name)
+   print(con)
+  #  stats.test <- as.data.frame(matrix(NA, ncol = 5, nrow = 1))
+  # colnames(stats.test) <- c("group1", "group2", "n1", "n2", "p")
+  # stats.test[1,] <- c("No biological children", "Biological children", 
+  #                            nrow(temp[which(temp$nr.children == 0),]), nrow(temp[which(temp$nr.children == 1),]),
+  #                            signif(con$p.value, digits = 4))
+  # stats.test <- stats.test %>% add_xy_position(data = temp, formula = envCont ~ nr.children, x = "nr.children")
+  # stats.test$p <- format(signif(as.numeric(stats.test$p), digits = 3), scientific = T)
+  # 
+  # temp$nr.children <- as.numeric(temp$nr.children)
+  # temp$nr.children[which(temp$nr.children == 1)] <- "No biological children"
+  # temp$nr.children[which(temp$nr.children == 2)] <- "Biological children"
+  # temp$nr.children <- relevel(as.factor(temp$nr.children), ref = "No biological children")
+  # 
+  # bxp <- ggboxplot(temp, x = "nr.children", y = "envCont", 
+  #           color = "nr.children", add = "jitter",
+  #           title = envCont.name) +
+  #   stat_pvalue_manual(stats.test, label = "p", size = 4)+ 
+  #   scale_color_manual(values = c("No biological children" = "#5c758a", "Biological children" = "#5c8a6d")) + 
+  #   theme(axis.title.x = element_blank(), axis.text.x = element_text(size = 12, angle = 15, vjust = 0.7),
+  #         plot.title = element_text(size = 12), 
+  #         axis.title.y = element_text(size = 12), axis.text.y = element_text(size = 10)) + 
+  #   ylab(expression("Log"[2]~"Conc. (ng/mL)")) +
+  #   ylim(c(min(temp$envCont, na.rm = T), max(temp$envCont, na.rm=T) + 1)) + 
+  #   scale_x_discrete(limits = c("No biological children", "Biological children"))
+  #   
+  #   
+  # plot_list[[i]] <- bxp
+  # i = i+1
+}
+
+ggsave(ggarrange(plotlist = plot_list[c(1:17)], ncol = 4, nrow = 5, labels = "AUTO", common.legend = T),
+       file = paste0(params$resultDir, "Imputed/Nr.children/Females.png"),
+       width = 12,
+       height = 16,
+       units = "in",
+       dpi = 300)
+```
+
+```{r nr children vs conc - Males}
+plot_list <- list()
+i = 1
+for(e in 1:17){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age","pairID", "collection.year", "BMI_curr", "BMI_20", "Week", "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children"))
+  temp <- dt.pfas[which(dt.pfas$Sex == 0),cols]
+  names(temp)[1] <- 'envCont'
+  temp$collection.year <- as.numeric(temp$collection.year)
+  
+  for(j in 1:nrow(temp)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(temp )[j])]
+  temp$nr.children[j] <- dt.children$antalbarn[which(dt.children$EIMS == eims.id)]
+  } 
+  temp$nr.children[which(is.na(temp$nr.children))] <- 0
+  
+  temp$nr.children[which(temp$nr.children > 0)] <- 1
+  temp$nr.children <- as.factor(temp$nr.children)
+  temp$treatment <- as.factor(temp$treatment)
+  temp$Type <- as.factor(temp$Type)
+  
+   mdl <- lme4::lmer(envCont ~ Type + collection.year + Age  + BMI_curr + BMI_20 + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + Week + nr.children + (1|pairID), data = na.omit(temp))
+   con <- as.data.frame(contrast(emmeans(mdl, specs = "nr.children"), method = "pairwise", adjust = "none"))
+   
+   stats.test <- as.data.frame(matrix(NA, ncol = 5, nrow = 1))
+  colnames(stats.test) <- c("group1", "group2", "n1", "n2", "p")
+  stats.test[1,] <- c("No biological children", "Biological children", 
+                             nrow(temp[which(temp$nr.children == 0),]), nrow(temp[which(temp$nr.children == 1),]),
+                             signif(con$p.value, digits = 4))
+  stats.test <- stats.test %>% add_xy_position(data = temp, formula = envCont ~ nr.children, x = "nr.children")
+  stats.test$p <- format(signif(as.numeric(stats.test$p), digits = 3), scientific = T)
+  
+  temp$nr.children <- as.numeric(temp$nr.children)
+  temp$nr.children[which(temp$nr.children == 1)] <- "No biological children"
+  temp$nr.children[which(temp$nr.children == 2)] <- "Biological children"
+  temp$nr.children <- relevel(as.factor(temp$nr.children), ref = "No biological children")
+  
+  bxp <- ggboxplot(temp, x = "nr.children", y = "envCont", 
+            color = "nr.children", add = "jitter",
+            title = envCont.name) +
+    stat_pvalue_manual(stats.test, label = "p", size = 4)+ 
+    scale_color_manual(values = c("No biological children" = "#5c758a", "Biological children" = "#5c8a6d")) + 
+    theme(axis.title.x = element_blank(), axis.text.x = element_text(size = 12, angle = 15, vjust = 0.7),
+          plot.title = element_text(size = 12), 
+          axis.title.y = element_text(size = 12), axis.text.y = element_text(size = 10)) + 
+    ylab(expression("Log"[2]~"Conc. (ng/mL)")) +
+    ylim(c(min(temp$envCont, na.rm = T), max(temp$envCont, na.rm=T) + 1)) + 
+    scale_x_discrete(limits = c("No biological children", "Biological children"))
+    
+    
+  plot_list[[i]] <- bxp
+  i = i+1
+}
+
+ggsave(ggarrange(plotlist = plot_list[c(1:17)], ncol = 4, nrow = 5, labels = "AUTO", common.legend = T),
+       file = paste0(params$resultDir, "Imputed/Nr.children/Males_BMI.png"),
+       width = 12,
+       height = 15,
+       units = "in",
+       dpi = 300)
+```
+
+
+# Linear mixed-effect regression analysis
+Compound concentration differences between MS and HC, RRMS and HC, and PMS and HC in males and females as well as separated by sex. PMS defined as SPMS and PPMS combined 
+```{r Linear-mixed-effect regression analysis}
+list.results <- list()
+results.MS.HC <- matrix(NA, ncol = 6, nrow = 20)
+colnames(results.MS.HC) <- c("MS fc", "MS P", "RRMS fc", "RRMS P", "PMS fc", "PMS P")
+rownames(results.MS.HC) <- colnames(dt.pfas)[1:20]
+
+covariates.table <- matrix(NA, ncol = 25, nrow = 20)
+rownames(covariates.table) <- colnames(dt.pfas)[1:20]
+colnames(covariates.table) <- c("coeff. - Sample collection year", "Anova P value - Sample collection year",
+                                "coeff. - Age", "Anova P value - Age",
+                                "coeff. - Sex (ref = Male)", "Anova P value - Sex (ref = Male)",
+                                "coeff. - BMI at sample collection", "Anova P value - BMI at sample collection",
+                                "coeff. - BMI at the age of 20", "Anova P value - BMI at the age of 20",
+                               "coeff. - Week", "Anova P value - Week",
+                               "coeff. - Years of regular smoking", "Anova P value - Years of regular smoking",
+                               "coeff. - Years of irregular smoking", "Anova P value - Years of irregular smoking",
+                               "coeff. - Years of passive smoking (indoors)", "Anova P value - Years of passive smoking (indoors)",
+                               "coeff. - treatment (First Line DMT)", "coeff. - treatment (Other drugs)",  "coeff. - treatment (Second Line DMT)", "Anova P value - treatment",
+                               "coeff. - Number of children", "Anova P value - Number of children",
+                               "Anova P value - Type*Sex")
+
+list.results[["MALE FC"]] <- as.data.frame(results.MS.HC)
+list.results[["FEMALE FC"]] <- as.data.frame(results.MS.HC)
+list.results[["BOTH FC"]] <-as.data.frame(results.MS.HC)
+
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", 
+                                    "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Type <- as.factor(temp$Type)
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Sex <- relevel(as.factor(temp$Sex), ref = "0")
+  temp$treatment <- relevel(as.factor(temp$treatment),  ref = "No treatment")
+  
+  # Linear mixed-effect regression analysis
+  mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + (1|pairID) + Type*Sex, data = na.omit(temp))
+
+  # Covariate table
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19:21,23)] <- format(signif(as.data.frame(coef(summary(mdl)))$Estimate[c(5:17)], digits = 3), scientific = T)
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(2,4,6,8,10,12,14,16,18,22,24, 25)] <- format(signif(Anova(mdl)$`Pr(>Chisq)`[c(2:13)], digits = 3), scientific = T)
+  
+  # Log2 fold change estimation using estimated marginal means
+  model_des <- model.matrix(~ 0 + temp$Type)
+  colnames(model_des) <- gsub(pattern = "temp$Type", replacement = "", x = colnames(model_des), fixed = T)
+  contrast <- limma::makeContrasts("MS vs HC" = (RR + SP + PP)/3 - HC,
+                                   "RR vs HC" = RR - HC,
+                                   "PMS vs HC" = (SP + PP)/2 - HC,
+                                   levels = model_des)
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  list.results[["BOTH FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[1:3], digits = 3), scientific = T)
+  list.results[["BOTH FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[1:3], digits = 3), scientific = T)
+  
+  # Log2 fold change estimation using estimated marginal means devided by sex
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type", by = "Sex"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  list.results[["MALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[1:3], digits = 3), scientific = T)
+  list.results[["MALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[1:3], digits = 3), scientific = T)
+  list.results[["FEMALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[4:6], digits = 3), scientific = T)
+  list.results[["FEMALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[4:6], digits = 3), scientific = T)
+}
+
+# Heatmap plot of males and females
+results.MS.HC <- list.results[["BOTH FC"]][,c(1,3,5)]
+results.MS.HC$class <- factor(c(rep('short-chain PFAS', 3), rep("long-chain PFAS", 13), rep("FTS", 1), rep("OH-PCB", 3)),
+                                 levels = c('short-chain PFAS', "long-chain PFAS","FTS", "OH-PCB"))
+
+ha = rowAnnotation(Class = results.MS.HC$class,
+                   col = list(Class = c("short-chain PFAS" = "#E10ACE", 
+                                  "long-chain PFAS" = "#A30AE1", 
+                                  "FTS" = "#71E8F9", 
+                                  "OH-PCB" = "#71F9B5")),
+                       annotation_legend_param = list(Class = list(
+                       	ncol = 1, 
+                       	title = "Class", 
+                       	title_position = "topleft")))
+
+
+fc <- apply(as.matrix(list.results[["BOTH FC"]][,c(1,3,5)]), 2, function(x) as.numeric(x))
+rownames(fc) <- rownames(as.matrix(list.results[["BOTH FC"]][,c(1,3,5)]))
+colnames(fc) <-  c("MS vs HC", "RRMS vs HC", "PMS vs HC")
+
+fcP <- apply(as.matrix(list.results[["BOTH FC"]][,c(1,3,5)+1]), 2, function(x) as.numeric(x))
+rownames(fcP) <- rownames(as.matrix(list.results[["BOTH FC"]][,c(1,3,5)]))
+colnames(fcP) <-  c("MS vs HC", "RRMS vs HC", "PMS vs HC")
+  
+pdf(paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Heatmap.Males.Females.pdf"), 
+    width = 5.5, 
+    height = 8)
+heatmapPlot(fc = fc, 
+            fcP = fcP, 
+            title = "", 
+            rowClust = FALSE, 
+            maxVal = 1, 
+            minVal = -1, 
+            width_size = 2, 
+            annotate = ha, 
+            showLegend = TRUE)
+dev.off()
+
+# Heatmap plot dividedby sex
+heatmapBySex(fc.Male = as.matrix(list.results[["MALE FC"]][,c(1,3,5)]), fcP.Male = as.matrix(list.results[["MALE FC"]][,c(1,3,5)+1]),
+             fc.Female = as.matrix(list.results[["FEMALE FC"]][,c(1,3,5)]), fcP.Female = as.matrix(list.results[["FEMALE FC"]][,c(1,3,5)+1]),
+             row.names = rownames(covariates.table),
+             ha = ha,
+             filename = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Heatmap.by.Sex."),
+             width = 8)
+
+
+# Save files
+write.csv(list.results[["MALE FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/FC.bySex.Male.csv"))
+write.csv(list.results[["FEMALE FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/FC.bySex.Female.csv"))
+write.csv(list.results[["BOTH FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/FC.csv"))
+write.csv(covariates.table, file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/covar.bySex.csv"))
+```
+
+```{r F-value and degrees of freedom}
+covariates.table <- matrix(NA, ncol = 24, nrow = 20)
+rownames(covariates.table) <- colnames(dt.pfas)[1:20]
+colnames(covariates.table) <- c("Anova F value - Sample collection year", "Anova DF - Sample collection year",
+                                "Anova F value - Age", "Anova DF - Age",
+                                "Anova F value - Sex", "Anova DF - Sex",
+                                "Anova F value - BMI at sample collection", "Anova DF - BMI at sample collection",
+                                "Anova F value - BMI at the age of 20", "Anova DF - BMI at the age of 20",
+                               "Anova F value - Week", "Anova DF - Week",
+                               "Anova F value - years regular smoking", "Anova DF - Years regular smoking",
+                               "Anova F value - Years irregular smoking", "Anova DF - Years irregular smoking",
+                               "Anova F value - Years passive smoking", "Anova DF - Years passive smoking",
+                               "Anova F value - Treatment", "Anova DF - Treatment",
+                               "Anova F value - Number of children", "Anova DF - Number of children",
+                               "Anova F value - Type*Sex", "Anova DF - Type*Sex")
+
+
+for(e in 1:(ncol(dt.pfas)-rm.col)){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", 
+                                    "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", 
+                                    "nr.children"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Type <- as.factor(temp$Type)
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Sex <- relevel(as.factor(temp$Sex), ref = "0")
+  temp$treatment <- relevel(as.factor(temp$treatment),  ref = "No treatment")
+  
+  # Linear mixed-effect regression model
+  mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + (1|pairID) + Type*Sex, data = na.omit(temp))
+
+  # F values and degrees of freedom for covariates
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19,21,23)] <- format(signif(Anova(mdl, test.statistic = "F")$F[c(2:13)], digits = 3), scientific = T)
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19,21,23)+1] <- Anova(mdl, test.statistic = "F")$Df[c(2:13)]
+  
+}
+
+# Save files
+write.csv(covariates.table, file = paste0(params$resultDir, "Imputed/LinearRegression/Covar.F_and_DF_values.csv"))
+```
+
+## Sensitivity analysis- Nordic born status
+Model includes nordic born status
+```{r Linear mixed-effect regression model including Nordic born status}
+list.results <- list()
+results.MS.HC <- matrix(NA, ncol = 6, nrow = 20)
+colnames(results.MS.HC) <- c("MS fc", "MS P", "RRMS fc", "RRMS P", "PMS fc", "PMS P")
+rownames(results.MS.HC) <- colnames(dt.pfas)[1:20]
+
+covariates.table <- matrix(NA, ncol = 27, nrow = 20)
+rownames(covariates.table) <- colnames(dt.pfas)[1:20]
+colnames(covariates.table) <- c("coeff. - Sample collection year", "Anova P value - Sample collection year",
+                                "coeff. - Age", "Anova P value - Age",
+                                "coeff. - Sex (ref = Male)", "Anova P value - Sex (ref = Male)",
+                                "coeff. - BMI at sample collection", "Anova P value - BMI at sample collection",
+                                "coeff. - BMI at the age of 20", "Anova P value - BMI at the age of 20",
+                               "coeff. - Week", "Anova P value - Week",
+                               "coeff. - Years of regular smoking", "Anova P value - Years of regular smoking",
+                               "coeff. - Years of irregular smoking", "Anova P value - Years of irregular smoking",
+                               "coeff. - Years of passive smoking (indoors)", "Anova P value - Years of passive smoking (indoors)",
+                               "coeff. - treatment (First Line DMT)", "coeff. - treatment (Other drugs)",  "coeff. - treatment (Second Line DMT)", "Anova P value - treatment",
+                               "coeff. - Number of children", "Anova P value - Number of children",
+                               "coeff. - Nordic", "Anova P value - Nordic",
+                               "Anova P value - Type*Sex")
+
+list.results[["MALE FC"]] <- as.data.frame(results.MS.HC)
+list.results[["FEMALE FC"]] <- as.data.frame(results.MS.HC)
+list.results[["BOTH FC"]] <-as.data.frame(results.MS.HC)
+
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", 
+                                    "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children", "Nordic"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Type <- as.factor(temp$Type)
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Sex <- relevel(as.factor(temp$Sex), ref = "0")
+  temp$treatment <- relevel(as.factor(temp$treatment),  ref = "No treatment")
+
+  # Linear mixed-effect regression model
+  mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + Nordic + (1|pairID) + Type*Sex, data = na.omit(temp))
+
+  # Covariate table including estimates and Anova p-values
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19:21,23,25)] <- format(signif(as.data.frame(coef(summary(mdl)))$Estimate[c(5:18)], digits = 3), scientific = T)
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(2,4,6,8,10,12,14,16,18,22,24,26,27)] <- format(signif(Anova(mdl)$`Pr(>Chisq)`[c(2:14)], digits = 3), scientific = T)
+  
+  # Log2 fold change analysis using estimated marginal means in males and females
+  model_des <- model.matrix(~ 0 + temp$Type)
+  colnames(model_des) <- gsub(pattern = "temp$Type", replacement = "", x = colnames(model_des), fixed = T)
+  contrast <- limma::makeContrasts("MS vs HC" = (RR + SP + PP)/3 - HC,
+                                   "RR vs HC" = RR - HC,
+                                   "PMS vs HC" = (SP + PP)/2 - HC,
+                                   levels = model_des)
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  list.results[["BOTH FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[1:3], digits = 3), scientific = T)
+  list.results[["BOTH FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[1:3], digits = 3), scientific = T)
+  
+  # Log2 fold change analysis divided by sex
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type", by = "Sex"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  list.results[["MALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[1:3], digits = 3), scientific = T)
+  list.results[["MALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[1:3], digits = 3), scientific = T)
+  list.results[["FEMALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[4:6], digits = 3), scientific = T)
+  list.results[["FEMALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[4:6], digits = 3), scientific = T)
+}
+
+# Save files
+write.csv(list.results[["MALE FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Nordic/FC.bySex.Male.csv"))
+write.csv(list.results[["FEMALE FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Nordic/FC.bySex.Female.csv"))
+write.csv(list.results[["BOTH FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Nordic/FC.csv"))
+write.csv(covariates.table, file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Nordic/covar.bySex.csv"))
+```
+
+```{r F-value and degrees of freedom}
+covariates.table <- matrix(NA, ncol = 26, nrow = 20)
+rownames(covariates.table) <- colnames(dt.pfas)[1:20]
+colnames(covariates.table) <- c("Anova F value - Sample collection year", "Anova DF - Sample collection year",
+                                "Anova F value - Age", "Anova DF - Age",
+                                "Anova F value - Sex", "Anova DF - Sex",
+                                "Anova F value - BMI at sample collection", "Anova DF - BMI at sample collection",
+                                "Anova F value - BMI at the age of 20", "Anova DF - BMI at the age of 20",
+                               "Anova F value - Week", "Anova DF - Week",
+                               "Anova F value - years regular smoking", "Anova DF - Years regular smoking",
+                               "Anova F value - Years irregular smoking", "Anova DF - Years irregular smoking",
+                               "Anova F value - Years passive smoking", "Anova DF - Years passive smoking",
+                               "Anova F value - Treatment", "Anova DF - Treatment",
+                               "Anova F value - Number of children", "Anova DF - Number of children",
+                               "Anova F value - Nordic born", "Anova DF - Nordic born",
+                               "Anova F value - Type*Sex", "Anova DF - Type*Sex")
+
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", 
+                                    "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", 
+                                    "nr.children", "Nordic"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Type <- as.factor(temp$Type)
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Sex <- relevel(as.factor(temp$Sex), ref = "0")
+  temp$treatment <- relevel(as.factor(temp$treatment),  ref = "No treatment")
+
+  # Linear mixed-effect regression analysis 
+  mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + Nordic + (1|pairID) + Type*Sex, data = na.omit(temp))
+
+  # Covariate table
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19,21,23,25)] <- format(signif(Anova(mdl, test.statistic = "F")$F[c(2:14)], digits = 3), scientific = T)
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19,21,23,25)+1] <- Anova(mdl, test.statistic = "F")$Df[c(2:14)]
+  
+}
+
+# Save files
+write.csv(covariates.table, 
+          file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Nordic/F_and_DF_values.csv"))
+```
+
+## Sensitivity analysis- Swedish born status
+Model includes Swedish born status
+```{r Linear mixed-effect regression model including Swedish born status}
+list.results <- list()
+results.MS.HC <- matrix(NA, ncol = 6, nrow = 20)
+colnames(results.MS.HC) <- c("MS fc", "MS P", "RRMS fc", "RRMS P", "PMS fc", "PMS P")
+rownames(results.MS.HC) <- colnames(dt.pfas)[1:20]
+
+covariates.table <- matrix(NA, ncol = 27, nrow = 20)
+rownames(covariates.table) <- colnames(dt.pfas)[1:20]
+colnames(covariates.table) <- c("coeff. - Sample collection year", "Anova P value - Sample collection year",
+                                "coeff. - Age", "Anova P value - Age",
+                                "coeff. - Sex (ref = Male)", "Anova P value - Sex (ref = Male)",
+                                "coeff. - BMI at sample collection", "Anova P value - BMI at sample collection",
+                                "coeff. - BMI at the age of 20", "Anova P value - BMI at the age of 20",
+                               "coeff. - Week", "Anova P value - Week",
+                               "coeff. - Years of regular smoking", "Anova P value - Years of regular smoking",
+                               "coeff. - Years of irregular smoking", "Anova P value - Years of irregular smoking",
+                               "coeff. - Years of passive smoking (indoors)", "Anova P value - Years of passive smoking (indoors)",
+                               "coeff. - treatment (First Line DMT)", "coeff. - treatment (Other drugs)",  "coeff. - treatment (Second Line DMT)", "Anova P value - treatment",
+                               "coeff. - Number of children", "Anova P value - Number of children",
+                               "coeff. - Swedish", "Anova P value - Swedish",
+                               "Anova P value - Type*Sex")
+
+list.results[["MALE FC"]] <- as.data.frame(results.MS.HC)
+list.results[["FEMALE FC"]] <- as.data.frame(results.MS.HC)
+list.results[["BOTH FC"]] <-as.data.frame(results.MS.HC)
+
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", 
+                                    "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children", "Swedish"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Type <- as.factor(temp$Type)
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Sex <- relevel(as.factor(temp$Sex), ref = "0")
+  temp$treatment <- relevel(as.factor(temp$treatment),  ref = "No treatment")
+
+  # Linear mixed-effect regression model
+  mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + Swedish + (1|pairID) + Type*Sex, data = na.omit(temp))
+
+  # Covariate table including estimates and Anova p-values
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19:21,23,25)] <- format(signif(as.data.frame(coef(summary(mdl)))$Estimate[c(5:18)], digits = 3), scientific = T)
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(2,4,6,8,10,12,14,16,18,22,24,26,27)] <- format(signif(Anova(mdl)$`Pr(>Chisq)`[c(2:14)], digits = 3), scientific = T)
+  
+  # Log2 fold change analysis using estimated marginal means in males and females
+  model_des <- model.matrix(~ 0 + temp$Type)
+  colnames(model_des) <- gsub(pattern = "temp$Type", replacement = "", x = colnames(model_des), fixed = T)
+  contrast <- limma::makeContrasts("MS vs HC" = (RR + SP + PP)/3 - HC,
+                                   "RR vs HC" = RR - HC,
+                                   "PMS vs HC" = (SP + PP)/2 - HC,
+                                   levels = model_des)
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  list.results[["BOTH FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[1:3], digits = 3), scientific = T)
+  list.results[["BOTH FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[1:3], digits = 3), scientific = T)
+  
+  # Log2 fold change analysis divided by sex
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type", by = "Sex"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  list.results[["MALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[1:3], digits = 3), scientific = T)
+  list.results[["MALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[1:3], digits = 3), scientific = T)
+  list.results[["FEMALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[4:6], digits = 3), scientific = T)
+  list.results[["FEMALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[4:6], digits = 3), scientific = T)
+}
+
+# Save files
+write.csv(list.results[["MALE FC"]], 
+          file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Swedish/FC.bySex.Male.csv"))
+write.csv(list.results[["FEMALE FC"]], 
+          file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Swedish/FC.bySex.Female.csv"))
+write.csv(list.results[["BOTH FC"]], 
+          file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Swedish/FC.csv"))
+write.csv(covariates.table, 
+          file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Swedish/covar.bySex.csv"))
+```
+
+```{r F-value and degrees of freedom}
+covariates.table <- matrix(NA, ncol = 26, nrow = 20)
+rownames(covariates.table) <- colnames(dt.pfas)[1:20]
+colnames(covariates.table) <- c("Anova F value - Sample collection year", "Anova DF - Sample collection year",
+                                "Anova F value - Age", "Anova DF - Age",
+                                "Anova F value - Sex", "Anova DF - Sex",
+                                "Anova F value - BMI at sample collection", "Anova DF - BMI at sample collection",
+                                "Anova F value - BMI at the age of 20", "Anova DF - BMI at the age of 20",
+                               "Anova F value - Week", "Anova DF - Week",
+                               "Anova F value - years regular smoking", "Anova DF - Years regular smoking",
+                               "Anova F value - Years irregular smoking", "Anova DF - Years irregular smoking",
+                               "Anova F value - Years passive smoking", "Anova DF - Years passive smoking",
+                               "Anova F value - Treatment", "Anova DF - Treatment",
+                               "Anova F value - Number of children", "Anova DF - Number of children",
+                               "Anova F value - Swedish born", "Anova DF - Swedish born",
+                               "Anova F value - Type*Sex", "Anova DF - Type*Sex")
+
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", 
+                                    "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", 
+                                    "nr.children", "Swedish"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Type <- as.factor(temp$Type)
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Sex <- relevel(as.factor(temp$Sex), ref = "0")
+  temp$treatment <- relevel(as.factor(temp$treatment),  ref = "No treatment")
+
+  # Linear mixed-effect regression analysis 
+  mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + Swedish + (1|pairID) + Type*Sex, data = na.omit(temp))
+
+  # Covariate table
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19,21,23,25)] <- format(signif(Anova(mdl, test.statistic = "F")$F[c(2:14)], digits = 3), scientific = T)
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19,21,23,25)+1] <- Anova(mdl, test.statistic = "F")$Df[c(2:14)]
+  
+}
+
+# Save files
+write.csv(covariates.table, 
+          file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/Swedish/F_and_DF_values.csv"))
+```
+
+## Sensitivity analysis (remove paring, thus removing residential area)
+Since HC and MS are matched on age, sex, and residential area removing pairID (the matching) in the model will exclude the effect of residential area. 
+```{r Sensitivity analysis removing paring}
+list.results <- list()
+results.MS.HC <- matrix(NA, ncol = 6, nrow = 20)
+colnames(results.MS.HC) <- c("MS fc", "MS P", "RRMS fc", "RRMS P", "PMS fc", "PMS P")
+rownames(results.MS.HC) <- colnames(dt.pfas)[1:20]
+
+covariates.table <- matrix(NA, ncol = 25, nrow = 20)
+rownames(covariates.table) <- colnames(dt.pfas)[1:20]
+colnames(covariates.table) <- c("coeff. - Sample collection year", "Anova P value - Sample collection year",
+                                "coeff. - Age", "Anova P value - Age",
+                                "coeff. - Sex (ref = Male)", "Anova P value - Sex (ref = Male)",
+                                "coeff. - BMI at sample collection", "Anova P value - BMI at sample collection",
+                                "coeff. - BMI at the age of 20", "Anova P value - BMI at the age of 20",
+                               "coeff. - Week", "Anova P value - Week",
+                               "coeff. - Years of regular smoking", "Anova P value - Years of regular smoking",
+                               "coeff. - Years of irregular smoking", "Anova P value - Years of irregular smoking",
+                               "coeff. - Years of passive smoking (indoors)", "Anova P value - Years of passive smoking (indoors)",
+                               "coeff. - treatment (First Line DMT)", "coeff. - treatment (Other drugs)",  "coeff. - treatment (Second Line DMT)", "Anova P value - treatment",
+                               "coeff. - Number of children", "Anova P value - Number of children",
+                               "Anova P value - Type*Sex")
+
+list.results[["MALE FC"]] <- as.data.frame(results.MS.HC)
+list.results[["FEMALE FC"]] <- as.data.frame(results.MS.HC)
+list.results[["BOTH FC"]] <-as.data.frame(results.MS.HC)
+
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", 
+                                    "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$Type <- as.factor(temp$Type)
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Sex <- relevel(as.factor(temp$Sex), ref = "0")
+  temp$treatment <- relevel(as.factor(temp$treatment),  ref = "No treatment")
+  
+  # Linear regression model
+  mdl <- lm(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children  + Type*Sex, data = na.omit(temp))
+
+  # Covariate table
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19:21,23)] <- format(signif(as.data.frame(coef(summary(mdl)))$Estimate[c(5:17)], digits = 3), scientific = T)
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(2,4,6,8,10,12,14,16,18,22,24,25)] <- format(signif(Anova(mdl)$`Pr(>F)`[c(2:13)], digits = 3), scientific = T)
+  
+  # Log2 fold change estimation using estimated marginal means in males and females
+  model_des <- model.matrix(~ 0 + temp$Type)
+  colnames(model_des) <- gsub(pattern = "temp$Type", replacement = "", x = colnames(model_des), fixed = T)
+  contrast <- limma::makeContrasts("MS vs HC" = (RR + SP + PP)/3 - HC,
+                                   "RR vs HC" = RR - HC,
+                                   "PMS vs HC" = (SP + PP)/2 - HC,
+                                   levels = model_des)
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  list.results[["BOTH FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[1:3], digits = 3), scientific = T)
+  list.results[["BOTH FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[1:3], digits = 3), scientific = T)
+  
+  # Log2 fold change estimation divided by sex
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type", by = "Sex"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  list.results[["MALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[1:3], digits = 3), scientific = T)
+  list.results[["MALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[1:3], digits = 3), scientific = T)
+  list.results[["FEMALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)] <- format(signif(con$estimate[4:6], digits = 3), scientific = T)
+  list.results[["FEMALE FC"]][which(rownames(results.MS.HC) == envCont.name),c(1,3,5)+1] <- format(signif(con$p.value[4:6], digits = 3), scientific = T)
+}
+
+# Save files
+write.csv(list.results[["MALE FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/rm.pairing/FC.bySex.Male.csv"))
+write.csv(list.results[["FEMALE FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/rm.pairing/FC.bySex.Female.csv"))
+write.csv(list.results[["BOTH FC"]], file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/rm.pairing/FC.csv"))
+write.csv(covariates.table, file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/rm.pairing/covar.bySex.csv"))
+```
+
+```{r F-value and degrees of freedom}
+covariates.table <- matrix(NA, ncol = 24, nrow = 20)
+rownames(covariates.table) <- colnames(dt.pfas)[1:20]
+colnames(covariates.table) <- c("Anova F value - Sample collection year", "Anova DF - Sample collection year",
+                                "Anova F value - Age", "Anova DF - Age",
+                                "Anova F value - Sex", "Anova DF - Sex",
+                                "Anova F value - BMI at sample collection", "Anova DF - BMI at sample collection",
+                                "Anova F value - BMI at the age of 20", "Anova DF - BMI at the age of 20",
+                               "Anova F value - Week", "Anova DF - Week",
+                               "Anova F value - years regular smoking", "Anova DF - Years regular smoking",
+                               "Anova F value - Years irregular smoking", "Anova DF - Years irregular smoking",
+                               "Anova F value - Years passive smoking", "Anova DF - Years passive smoking",
+                               "Anova F value - Treatment", "Anova DF - Treatment",
+                               "Anova F value - Number of children", "Anova DF - Number of children",
+                               "Anova F value - Type*Sex", "Anova DF - Type*Sex")
+
+
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", 
+                                    "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", 
+                                    "nr.children"))
+  temp <- dt.pfas[,cols]
+  names(temp)[1] <- 'envCont'
+  temp$envCont[temp$envCont == "-Inf"] <- NA
+  temp$Type <- as.factor(temp$Type)
+  temp$collection.year <- as.numeric(temp$collection.year)
+  temp$Sex <- relevel(as.factor(temp$Sex), ref = "0")
+  temp$treatment <- relevel(as.factor(temp$treatment),  ref = "No treatment")
+
+  # Linear regression model
+  mdl <- lm(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + Type*Sex, data = na.omit(temp))
+
+  # Covariate table
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19,21,23)] <- format(signif(Anova(mdl, test.statistic = "F")$F[c(2:13)], digits = 3), scientific = T)
+  covariates.table[which(rownames(covariates.table) == envCont.name),c(1,3,5,7,9,11,13,15,17,19,21,23)+1] <- Anova(mdl, test.statistic = "F")$Df[c(2:13)]
+  
+}
+
+# Save files
+write.csv(covariates.table, file = paste0(params$resultDir, "Imputed/LinearRegression/FinalModel/rm.pairing/F_and_DF_values.csv"))
+```
+
+## Boxplot of concentration differences between HC and RRMS and PMS divided by sex
+```{r Boxplot divided by sex}
+plot_list <- list()
+step.increase.values <- c(0.03, rep(0.02, 2), 0.022, rep(0.02,4), rep(0.022, 3), 0.02, rep(0.025, 3), 0.025, 0.02, rep(0.02,3))
+max.y <- c(3, 3, rep(1.5, 15), rep(1.5,3))
+for(e in 1:20){
+  envCont.name <- colnames(dt.pfas)[e]
+  
+  cols <- append(c(envCont.name), c("Type", "Age", "Sex", "pairID", "collection.year", "BMI_curr", "BMI_20", "Week", "years.reg.smoking", "years.irreg.smoking", "years.passive.smoking", "treatment", "nr.children"))
+  dt <- dt.pfas[,cols]
+  names(dt)[1] <- 'envCont'
+  dt$collection.year <- as.numeric(dt$collection.year)
+  dt$Sex <- relevel(as.factor(dt$Sex), ref = "0")
+  dt$treatment <- relevel(as.factor(dt$treatment),  ref = "No treatment")
+  
+  # Linear mixed-effect regression analysis
+  mdl <- lme4::lmer(envCont ~ Type + collection.year + Age + Sex + BMI_curr + BMI_20 + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + (1|pairID) + Type*Sex, data = na.omit(dt))
+  
+  # Log2 fold change estimation divided by sex
+  model_des <- model.matrix(~ 0 + dt$Type)
+  colnames(model_des) <- gsub(pattern = "dt$Type", replacement = "", x = colnames(model_des), fixed = T)
+  contrast <- limma::makeContrasts("MS vs HC" = (RR + SP + PP)/3 - HC,
+                                   "RR vs HC" = RR - HC,
+                                   "PMS vs HC" = (SP + PP)/2 - HC,
+                                   levels = model_des)
+  con <- as.data.frame(contrast(emmeans(mdl, specs = "Type", by = "Sex"), method = list("MS vs HC" = contrast[,"MS vs HC"],
+                                                                            "RR vs HC" = contrast[,"RR vs HC"],
+                                                                            "PMS vs HC" = contrast[,"PMS vs HC"]), adjust = "none"))
+  
+  # Illustration of results using boxplot
+  dt$Type[which(dt$Type == "RR" & dt$Sex == 0)] <- "RR, Man"
+  dt$Type[which(dt$Type == "RR" & dt$Sex == 1)] <- "RR, Woman"
+  dt$Type[which(dt$Type %in% c("SP", "PP") & dt$Sex == 0)] <- "PMS, Man"
+  dt$Type[which(dt$Type%in% c("SP", "PP")  & dt$Sex == 1)] <- "PMS, Woman"
+  dt$Type[which(dt$Type == "HC" & dt$Sex == 0)] <- "HC, Man"
+  dt$Type[which(dt$Type == "HC" & dt$Sex == 1)] <- "HC, Woman"  
+  level_order <- c('HC, Man', 'HC, Woman', 
+                 'RR, Man', 'RR, Woman',
+                 'SP, Man', 'SP, Woman',
+                 'PP, Man', 'PP, Woman') 
+  dt$Type <- as.factor(dt$Type)
+  
+  stats.test.paired <- as.data.frame(matrix(NA, ncol = 5, nrow = 4))
+  colnames(stats.test.paired) <- c("group1", "group2", "n1", "n2", "p")
+  stats.test.paired$group1 <- c("HC, Man", "HC, Woman", "HC, Man", "HC, Woman")
+  stats.test.paired$group2 <- c("RR, Man", "RR, Woman", "PMS, Man", "PMS, Woman")
+  stats.test.paired$n1 <- c(nrow(dt[which(dt$Type == "HC, Man"),]),
+                            nrow(dt[which(dt$Type == "HC, Woman"),]),
+                            nrow(dt[which(dt$Type == "HC, Man"),]),
+                            nrow(dt[which(dt$Type == "HC, Woman"),]))
+  stats.test.paired$n2 <- c(nrow(dt[which(dt$Type == "RR, Man"),]),
+                            nrow(dt[which(dt$Type == "RR, Woman"),]),
+                            nrow(dt[which(dt$Type == "PMS, Man"),]),
+                            nrow(dt[which(dt$Type == "PMS, Woman"),]))
+  stats.test.paired$p <- signif(con$p.value[c(2,5,3,6)], digits = 3)
+  stats.test.paired <- stats.test.paired %>% add_significance() %>% add_xy_position(data = dt, formula = envCont ~ Type, x = "Type")
+  stats.test.paired$xmin <- c(1,4,1,4)
+  stats.test.paired$xmax <- c(2,5,3,6)
+  stats.test.paired$y.position <- stats.test.paired$y.position[c(3,4,1,2)]
+  stats.test.paired$p <- format(stats.test.paired$p, scientific = T)
+  dt$Type <- factor(dt$Type, levels = c("HC, Man", "RR, Man", "PMS, Man",
+                                        "HC, Woman", "RR, Woman", "PMS, Woman"))
+  
+  plot_list[[e]] <- ggboxplot(dt, x = "Type", y = "envCont", 
+                   color = "Sex", add = "jitter",
+                   title = envCont.name) +
+    stat_pvalue_manual(stats.test.paired, 
+                       label = "p", 
+                       step.increase = step.increase.values[e], 
+                       size = 4) + 
+    ylab(expression("Log"[2]~"Conc. (ng/mL)")) + 
+    theme(axis.title.x = element_blank(), 
+          title = element_text(size =12, family = "sans"), 
+          axis.text = element_text(size = 12, family = "sans"), 
+          axis.title.y = element_text(size = 12, family = "sans"), 
+          legend.text = element_text(size = 12, family = "sans"), 
+          axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5)) + 
+    scale_color_manual(values = c("0" = "#0778DC", "1" = "#C90D96"), 
+                       labels = c("Male", "Female")) + 
+    scale_x_discrete(labels = c("HC", "RRMS", "PMS", "HC", "RRMS", "PMS")) + 
+    ylim(c(min(dt$envCont, na.rm=T), max(stats.test.paired$y.position)+max.y[e]))
+
+}
+
+ggsave(ggarrange(plotlist = plot_list, ncol = 4, nrow = 5, labels = "AUTO", common.legend = T, font.label = 8), 
+       file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/ConcComp/BySex/SupplementaryMaterials.pdf", 
+       height = 20, width = 15, dpi = 300)
+```
+
+# Confirmed disability worsening
+Patients for whom the closest hospital visit occured more than 3 months prior or after blood sample collection were excluded from further analysis.
+```{r Exclyde patients where the closest visit occured more than 3 months from sample collection}
+temp <- smsReg
+eims.smsReg.id <- unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2]))
+temp <- smsReg[which(smsReg$patient.code %in% eims.smsReg.id),]
+
+# Exclude visits with an edss = NA
+temp <- temp[-which(is.na(temp$edss.value.score)),]
+
+# Exclude patients with a closest visit more than 3 months from sample collection
+diff.visits <- c()
+for(i in unique(temp$patient.code)){
+  eims.id <- eims.smsreg.key$EIMS_1[which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)] 
+  if(length(which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)) == 0){
+    eims.id <- eims.metadata$EIMS_ID[which(unlist(lapply(eims.metadata$smsreg_id_payam_match, function(x) strsplit(x, "SMS")[[1]][2])) == i)]
+  }
+  samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+  
+  visits <- unlist(lapply(temp$visit_date[which(temp$patient.code == i)], function(x) difftime(as.Date(x), samp.time, units = "days")/ (365.25/12)))
+  diff.visits <- append(diff.visits, min(abs(visits), na.rm=T))
+}
+
+temp <- temp[-which(temp$patient.code %in% unique(temp$patient.code)[which(diff.visits > 3)]),] # 359 patients were excluded
+```
+
+```{r Data frame for confirmed disability worsening analysis}
+# ------ Data frame for cox regression analysis --------
+dt.cox <- data.frame(patient.id = eims.smsReg.id[which(eims.smsReg.id %in% temp$patient.code)],
+                        sex = unlist(lapply(eims.smsReg.id[which(eims.smsReg.id %in% temp$patient.code)], function(x) temp$sex[which(temp$patient.code == x)][1])))
+
+dt.cox$age <- NA
+dt.cox$time <- NA
+dt.cox$status <- NA
+dt.cox$collection.year <- NA
+dt.cox$diag.samp.diff <- NA
+dt.cox$BMI.20 <- NA
+dt.cox$BMI.curr <- NA
+dt.cox$Week <- NA
+dt.cox$years.reg.smoking <- NA
+dt.cox$years.irreg.smoking <- NA
+dt.cox$years.passive.smoking <- NA
+dt.cox$treatment <- NA
+dt.cox$edss.start <- NA
+dt.cox$nr.children <- NA
+
+edss_startpoint <- c(0, 1.5, 5.5)
+edss_endpoint <- c(1.5, 5, 10)
+edss.diff.progress <- c(1.5, 1, 0.5)
+for(i in dt.cox$patient.id){
+  eims.id <- eims.smsreg.key$EIMS_1[which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)] 
+  if(length(which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)) == 0){
+    eims.id <- eims.metadata$EIMS_ID[which(unlist(lapply(eims.metadata$smsreg_id_payam_match, function(x) strsplit(x, "SMS")[[1]][2])) == i)]
+  }
+  pair.id <- eims.metadata$pairid[which(eims.metadata$EIMS_ID == eims.id)]
+  samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+  diag.date <- as.Date(temp$diagnosis_date[which(temp$patient.code == i)][1])
+  if(length(which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)) > 0){
+    dt.cox$collection.year[which(dt.cox$patient.id == i)] <- dt.pfas$collection.year[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$diag.samp.diff[which(dt.cox$patient.id == i)] <- dt.pfas$diag.samp.diff[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$BMI.20[which(dt.cox$patient.id == i)] <- dt.pfas$BMI_20[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$BMI.curr[which(dt.cox$patient.id == i)] <- dt.pfas$BMI_curr[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$age[which(dt.cox$patient.id == i)] <- dt.pfas$Age[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$Week[which(dt.cox$patient.id == i)] <- dt.pfas$Week[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.reg.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.reg.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.irreg.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.irreg.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.passive.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.passive.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$treatment[which(dt.cox$patient.id == i)] <- dt.pfas$treatment[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$nr.children[which(dt.cox$patient.id == i)] <- dt.pfas$nr.children[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+  }
+  # Progression and time
+  visits <- temp$visit_date[which(temp$patient.code == i)]
+  reorder <- order(visits, decreasing = F)
+  visits <- visits[reorder]
+  visit.diff <- unlist(lapply(visits, function(x) difftime(as.Date(x), samp.time, units = "days")/ (365.25/12))) # Number of days between sample collection and hospital visit
+  edss.visits <- temp$edss.value.score[which(temp$patient.code == i)][reorder]
+  closest.visit <- which(abs(visit.diff) == min(abs(visit.diff), na.rm=T))
+  
+  # Defining patients EDSS starting point
+  ## if EDSS start is <1.5, n = 1
+  ## EDSS start is >= 1.5 and <5.5, n = 2
+  ## EDSS start >=5.5, n = 3
+  n = 1
+  if(edss.visits[closest.visit] >= edss_startpoint[3]){
+    n = 3
+  }else if(edss.visits[closest.visit] >= edss_startpoint[2]){
+    n = 2
+  }
+  
+  if(length(visits) == 1){ # Censur where only one visit has occured
+    dt.cox$status[which(dt.cox$patient.id == i)] <- 0
+    dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[1]), samp.time, units = "days") / (365.25/12)
+    dt.cox$edss.start[which(dt.cox$patient.id == i)] <- edss.visits
+  }else if(edss.visits[closest.visit] <= edss_endpoint[n]){ # If the edss is > edds_startpoint & < edss_endpoint -> check for progression
+    edss.diff <- unlist(lapply(edss.visits[(closest.visit+1):length(edss.visits)],
+                               function(x) x - edss.visits[closest.visit]))
+    p <- which(edss.diff >= edss.diff.progress[n])
+    dt.cox$edss.start[which(dt.cox$patient.id == i)] <- edss.visits[closest.visit]
+    if(length(p) <= 1){# if p is NA or 1 -> no progression 
+      dt.cox$status[which(dt.cox$patient.id == i)] <- 0
+      dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[length(visits)]), samp.time, units = "days") / (365.25/12)
+    }else if(length(p) == length(edss.diff)){ # if all edss.diff shows progression and it is more than 3 months between first p and last p, progression has occured
+      if(visit.diff[length(p)+closest.visit] - visit.diff[closest.visit] >= 3){
+        dt.cox$status[which(dt.cox$patient.id == i)] <- 1
+        dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[closest.visit+p[1]]), samp.time, units = "days") / (365.25/12)
+      }else{
+        dt.cox$status[which(dt.cox$patient.id == i)] <- 0
+        dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[length(visits)]), samp.time, units = "days") / (365.25/12)
+      }
+    }else if(length(p) > 1){ # Check if the progress is healed for 3 months
+      for(j in p){
+        if(closest.visit+j < length(visits)){
+          if(edss.visits[closest.visit+j+1] - edss.visits[closest.visit] >= edss.diff.progress[n]){
+            if(visit.diff[1+j+closest.visit] - visit.diff[j+closest.visit] >= 3){
+              dt.cox$status[which(dt.cox$patient.id == i)] <- 1
+              dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[closest.visit+j]), samp.time, units = "days") / (365.25/12)
+              break
+            }
+          }
+        }
+      }
+      if(is.na(dt.cox$time[which(dt.cox$patient.id == i)])){
+        dt.cox$status[which(dt.cox$patient.id == i)] <- 0
+        dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[length(visits)]), samp.time, units = "days") / (365.25/12)
+      }
+    }
+  }
+}
+
+# Include compound concentrations in th data frame
+covariates <- colnames(dt.pfas)[1:20]
+dt.covariates <- dt.pfas[,1:20]
+colnames(dt.covariates) <- covariates
+
+# Order dt.covariates in same order as dt.cox
+patID <- unlist(unique(dt.cox$patient.id))
+fileNames <- c()
+for(i in 1:length(patID)){
+  j <- eims.smsreg.key$EIMS_1[which(eims.smsReg.id == patID[i])]
+  fileNames <- append(fileNames,
+                      eims.metadata$eims_filename[which(eims.metadata$EIMS_ID == j)])
+}
+
+dt.covariates <- dt.covariates[which(rownames(dt.covariates) %in% fileNames),]
+dt.covariates <- dt.covariates[match(fileNames, rownames(dt.covariates)),]
+
+dt.cox <- cbind(dt.cox, dt.covariates)
+
+# Format collection year as numeric
+dt.cox$collection.year <- as.numeric(dt.cox$collection.year)
+
+# Include MS phenotype
+dt.cox$Type <- NA
+for(i in 1:nrow(dt.cox)){
+  if(length(dt.pfas$Type[which(rownames(dt.pfas) %in% eims.metadata$eims_filename[which(eims.metadata$EIMS_ID %in% eims.smsreg.key$EIMS_1[which(eims.smsreg.key$Register.Id %in% paste0("SMS",dt.cox$patient.id[i]))])])]) > 0){
+    dt.cox$Type[i] <- dt.pfas$Type[which(rownames(dt.pfas) %in% eims.metadata$eims_filename[which(eims.metadata$EIMS_ID %in% eims.smsreg.key$EIMS_1[which(eims.smsreg.key$Register.Id %in% paste0("SMS",dt.cox$patient.id[i]))])])]
+  }
+} 
+
+dt.cox$Type[which(dt.cox$Type %in% c("SP", "PP"))] <- "PMS"                               
+dt.cox$Type <- relevel(as.factor(dt.cox$Type), ref = "RR")
+dt.cox$treatment <- relevel(as.factor(dt.cox$treatment), ref = "No treatment")
+```
+
+## Cox proportional hazard analysis (fully adjusted model)
+```{r Cox proportional hazard analysis}
+# Model for males and females together
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + sex + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + nr.children')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox)})
+
+# Model for males only
+dt.cox.sex <- dt.cox[which(dt.cox$Sex == "MAN"),]
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '`+ age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Model for females only
+dt.cox.sex <- dt.cox[which(dt.cox$Sex == "WOMAN"),]
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + nr.children')))
+
+# Extract results 
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=3)
+                          coef<-signif(x$coef[n], digits=3)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 3)
+                          beta<-signif(x$coef[n], digits=3)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 3)
+                          HR.confint.upper <- signif(y$`upper .95`[n],3)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+
+# Write data into file
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+write.csv(file = paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/CoxReg.output.csv"), res)
+
+# Forest plot
+pdf(file = paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/Forestplot.pdf"))
+forestPlotAllComp(res, digits = 3)
+dev.off()
+```
+
+## Sensitivity analysis - Including treatment during follow-up time in the model
+Treatment is diivided into first-line DMT, second-line DMT, and other treatments. If such treatment has been administered during the follow-up time the value is set to 1.
+```{r}
+dt.cox.FU.treatment <- dt.cox
+
+dt.cox.FU.treatment$FU_firstline <- 0
+dt.cox.FU.treatment$FU_secondline <- 0
+dt.cox.FU.treatment$FU_other <- 0
+
+for(i in dt.cox.FU.treatment$patient.id){
+  eims.id <- eims.smsreg.key$EIMS_1[which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)] 
+  if(length(which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)) == 0){
+    eims.id <- eims.metadata$EIMS_ID[which(unlist(lapply(eims.metadata$smsreg_id_payam_match, function(x) strsplit(x, "SMS")[[1]][2])) == i)]
+  }
+  pair.id <- eims.metadata$pairid[which(eims.metadata$EIMS_ID == eims.id)]
+  samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+  diag.date <- as.Date(temp$diagnosis_date[which(temp$patient.code == i)][1])
+  
+  # Progression and time
+  visits <- temp$visit_date[which(temp$patient.code == i)]
+  reorder <- order(visits, decreasing = F)
+  visits <- visits[reorder]
+  visit.diff <- unlist(lapply(visits, function(x) difftime(as.Date(x), samp.time, units = "days")/ (365.25/12)))
+  
+  first_line <- temp$first_line_DMT[which(temp$patient.code == i)][reorder]
+  second_line <- temp$second_line_DMT[which(temp$patient.code == i)][reorder]
+  other_treat <- temp$other_drugs[which(temp$patient.code == i)][reorder]
+  relaps_treat <- temp$relapse_treatment_drugs[which(temp$patient.code == i)][reorder]
+  stemcell <- temp$stem_cell_treatment[which(temp$patient.code == i)][reorder]
+  
+  if(length(which(first_line[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_firstline[which(dt.cox$patient.id == i)] <- 1
+  }
+  if(length(which(second_line[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_secondline[which(dt.cox$patient.id == i)] <- 1
+  }
+  if(length(which(other_treat[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_other[which(dt.cox$patient.id == i)] <- 1
+  }else if(length(which(relaps_treat[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_other[which(dt.cox$patient.id == i)] <- 1
+  }else if(length(which(stemcell[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_other[which(dt.cox$patient.id == i)] <- 1
+  }
+}
+
+dt.cox.FU.treatment$FU_firstline <- as.factor(dt.cox.FU.treatment$FU_firstline)
+dt.cox.FU.treatment$FU_secondline <- as.factor(dt.cox.FU.treatment$FU_secondline)
+dt.cox.FU.treatment$FU_other <- as.factor(dt.cox.FU.treatment$FU_other)
+```
+### Cox proportional hazard analysis 
+```{r Cox proportional hazard analysis including treatment during follow-up time}
+# Model for males and females together
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + sex + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + nr.children + FU_firstline + FU_secondline + FU_other')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.FU.treatment)})
+
+# Model for males only
+dt.cox.sex <- dt.cox.FU.treatment[which(dt.cox.FU.treatment$sex == "MAN"),]
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + FU_firstline + FU_secondline + FU_other')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Model for females only
+dt.cox.sex <- dt.cox.FU.treatment[which(dt.cox.FU.treatment$sex == "WOMAN"),]
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + nr.children +  FU_firstline + FU_secondline + FU_other')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Extract results
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=3)
+                          coef<-signif(x$coef[n], digits=3)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 3)
+                          beta<-signif(x$coef[n], digits=3)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 3)
+                          HR.confint.upper <- signif(y$`upper .95`[n],3)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+
+# Save results
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+write.csv(file = paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/Treatment_during_FU/Cox.output.csv"), res)
+
+# Forest plot
+pdf(file = paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/Treatment_during_FU/Forestplot.pdf"))
+forestPlotAllComp(res, digits = 3)
+dev.off()
+```
+
+## Sensitivity analysis - Including serum albumin concentrations
+```{r Load albumin data}
+albumin <- read_xlsx("/Users/ainva234/Documents/Project/EIMS/Data/Albumin_week1_2.xlsx", sheet = "Blad1")
+alb.nyckel <- read_xlsx("/Users/ainva234/Documents/Project/EIMS/Data/Albumin_week1_2.xlsx", sheet = "info från Asma")
+
+albumin$albumin <- as.numeric(albumin$albumin)
+ggplot(albumin[which(albumin$Week == 1),], aes(x = `Sample ID`, y = albumin)) + geom_point()
+ggplot(albumin[which(albumin$Week == 2),], aes(x = `Sample ID`, y = albumin)) + geom_point()
+```
+
+```{r Add albumin concentrations}
+dt.cox.albumin <- dt.cox
+dt.cox.albumin$albumin <- NA
+for(i in 1:nrow(dt.cox)){
+pair.id <- dt.cox$pairID[i]
+barcode <- eims.metadata$Barcode[which(eims.metadata$pairid == pair.id & eims.metadata$MS == "m")]
+key <- alb.nyckel$`Sample ID Anders`[which(alb.nyckel$`sample ID CARAMBA` == barcode)]
+if(length(which(albumin$`Sample ID` == key)) == 1){
+  dt.cox.albumin$albumin[i] <- log2(as.numeric(albumin$albumin[which(albumin$`Sample ID` == key)]))
+}
+}
+```
+### Serum albumin association with confirmed disability worsening
+```{r Serum albumins association with confirmed disability worsening}
+# Model for males and females together
+univ_formulas <- sapply(c("albumin"),
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + sex + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.albumin)})
+
+# Model for males only
+dt.cox.sex <- dt.cox.albumin[which(dt.cox.albumin$sex == "MAN"),]
+univ_formulas <- sapply(c("albumin"),
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Model for females only
+dt.cox.sex <- dt.cox.albumin[which(dt.cox.albumin$sex == "WOMAN"),]
+univ_formulas <- sapply(c("albumin"),
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + nr.children')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Extract results 
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=3)
+                          coef<-signif(x$coef[n], digits=3)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 3)
+                          beta<-signif(x$coef[n], digits=3)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 3)
+                          HR.confint.upper <- signif(y$`upper .95`[n],3)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+res_final <- matrix(NA, nrow = 0, ncol = 3)
+res_final <- rbind(res_final, res)
+rownames(res_final) <- c("Males and Females", "Males", "Females")
+
+write.csv(file = paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/Albumin/Cox.Albumin.csv"), res_final)
+
+# Forest plot
+res <- read.csv(paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/Albumin/Cox.Albumin.csv"))
+digits = 3
+data <- tibble(Compound = rownames(res),
+                 p.value = res$p.value,
+                 mean = res$`hazard.ratio`,
+                 lower = res$HR.confint.lower,
+                 upper = res$HR.confint.upper,
+                 N = res$N)
+
+  # Number of digits shown 
+  data$p.value <- signif(data$p.value, digits = digits)
+  data$mean <- signif(data$mean, digits = digits)
+  data$lower <- signif(data$lower, digits = digits)
+  data$upper <- signif(data$upper, digits = digits)
+  
+  for(i in 1:nrow(data)){
+    if(data$p.value[i] < 0.01){
+      data$p.value[i] <- format(as.numeric(data$p.value[i]), scientific = T)
+    }
+  }
+  
+  data$conf.int <- NA
+  for(i in 1:nrow(data)){
+    data$conf.int[i] <- paste0(data$lower[i], "-", data$upper[i])
+  }
+  
+  data <- rbind(rep(NA,7), data)
+  
+  data$colour <- rep(c("white", "gray95"), nrow(data)/2)
+  p <- ggplot(data, aes(x = mean, y = Compound, xmin = lower, xmax = upper)) +
+    geom_hline(aes(yintercept = Compound, colour = colour), size = 7) + 
+    geom_pointrange(shape = 22, fill = "black") +
+    geom_vline(xintercept = 1, linetype = 3) +
+    xlab("Hazard ratio (95% CI)") +
+    ylab("") +
+    theme_classic() +
+    scale_colour_identity() +
+    scale_y_discrete(limits = rev(data$Compound)) +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank())
+  
+  fplottable  <- data[-1,c(1,6,2)]
+  fplottable <- rbind(c("Compound", "N", "P"),
+                      fplottable)
+  fplottable$`Hazard ratio (95% CI)` <- c("Hazard ratio",
+                                          unlist(lapply(data$Compound[-1], function(x) paste0(data$mean[which(data$Compound == x)], " (", data$lower[which(data$Compound == x)], "-", data$upper[which(data$Compound == x)], ")"))))
+  fplottable$color <- c("white", unlist(lapply(data$Compound[-1], function(x) data$colour[which(data$Compound == x)])))
+  fplottable$Compound <- factor(fplottable$Compound, levels = fplottable$Compound)
+  
+  
+  data_table <- ggplot(data = fplottable, aes(y = Compound)) +
+    geom_hline(aes(yintercept = Compound, colour = color), size = 5) +
+    geom_text(aes(x = 0, label = Compound), hjust = 0) +
+    geom_text(aes(x = 5, label = p.value)) +
+    geom_text(aes(x = 9, label = `Hazard ratio (95% CI)`), hjust = 1) +
+    scale_colour_identity() +
+    scale_y_discrete(limits = rev(fplottable$Compound)) +
+    theme_void() + 
+    theme(plot.margin = margin(5, 0, 35, 0)) 
+  
+  
+  ggsave(paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/Albumin/Forestplot.Albumin.pdf"), 
+       grid.arrange(as.grob(data_table), as.grob(p), ncol = 2),
+       width = 8,
+       height = 2,
+       units = "in")
+```
+### PFAS and OH-PCBs association with confirmed disability worsening, adjusted for serum albumin concentrations
+```{r Cox proportional hazard analysis adjusting for serum albumin concentrations}
+# Model for males and females together 
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '`  + sex + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + nr.children + albumin')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.albumin)})
+
+# Model for males only
+dt.cox.sex <- dt.cox.albumin[which(dt.cox.albumin$sex == "MAN"),]
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + albumin')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Model for females only
+dt.cox.sex <- dt.cox.albumin[which(dt.cox.albumin$sex == "WOMAN"),]
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '`+ age + BMI.curr + Week  + diag.samp.diff + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + edss.start + nr.children + albumin')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Extract results 
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=3)
+                          coef<-signif(x$coef[n], digits=3)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 3)
+                          beta<-signif(x$coef[n], digits=3)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 3)
+                          HR.confint.upper <- signif(y$`upper .95`[n],3)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+write.csv(file = paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/Albumin/Cox.csv"), res)
+
+# Forest plot
+pdf(file = paste0(params$resultDir, "Imputed/CoxRegression/EDSS/FinalModel/EDSS_start/Albumin/Forestplot.pdf"))
+forestPlotAllComp(res, digits = 3)
+dev.off()
+```
+
+# PFAS and OH-PCBs association with transition RRMS to SPMS
+```{r, Prepare data for Cox proportional hazard analysis}
+temp <- smsReg
+eims.smsReg.id <- unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2]))
+temp <- temp[which(temp$patient.code %in% eims.smsReg.id),]
+
+# Timepoint 0 = sampling timepoint
+# End timpoint = SP diagnosis or last visit
+
+dt.cox <- data.frame(patient.id = eims.smsReg.id[which(eims.smsReg.id %in% temp$patient.code)],
+                        sex = unlist(lapply(eims.smsReg.id[which(eims.smsReg.id %in% temp$patient.code)], function(x) temp$sex[which(temp$patient.code == x)][1])))
+
+dt.cox$age <- NA
+dt.cox$time <- NA
+dt.cox$to.SP <- NA
+dt.cox$collection.year <- NA
+dt.cox$diag.samp.diff <- NA
+dt.cox$BMI_20 <- NA
+dt.cox$BMI_curr <- NA
+dt.cox$Week <- NA
+dt.cox$treatment <- NA
+dt.cox$years.reg.smoking <- NA
+dt.cox$years.irreg.smoking <- NA
+dt.cox$years.passive.smoking <- NA
+dt.cox$nr.children <- NA
+
+remove.pat <- c() # Exclude patients that already were SP at sampling
+for(i in dt.cox$patient.id){
+  eims.id <- eims.smsreg.key$EIMS_1[which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)] 
+  if(length(which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)) == 0){
+    eims.id <- eims.metadata$EIMS_ID[which(unlist(lapply(eims.metadata$smsreg_id_payam_match, function(x) strsplit(x, "SMS")[[1]][2])) == i)]
+  }
+  pair.id <- eims.metadata$pairid[which(eims.metadata$EIMS_ID == eims.id)]
+  samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+  diag.date <- as.Date(temp$diagnosis_date[which(temp$patient.code == i)][1])
+  if(length(which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)) > 0){
+    dt.cox$collection.year[which(dt.cox$patient.id == i)] <- dt.pfas$collection.year[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$diag.samp.diff[which(dt.cox$patient.id == i)] <- dt.pfas$diag.samp.diff[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$BMI_20[which(dt.cox$patient.id == i)] <- dt.pfas$BMI_20[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$BMI_curr[which(dt.cox$patient.id == i)] <- dt.pfas$BMI_curr[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$age[which(dt.cox$patient.id == i)] <- dt.pfas$Age[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$Week[which(dt.cox$patient.id == i)] <- dt.pfas$Week[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.reg.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.reg.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.irreg.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.irreg.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.passive.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.passive.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$treatment[which(dt.cox$patient.id == i)] <- dt.pfas$treatment[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$nr.children[which(dt.cox$patient.id == i)] <- dt.pfas$nr.children[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+  }
+  # To SP
+  if(temp$to_sp[which(temp$patient.code == i)][1] == ""){
+    if(temp$progress[which(temp$patient.code == i)][1] == "RR - Intermittent progressive MS"){
+      visits <- temp$visit_date[which(temp$patient.code == i)]
+      dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(max(visits,na.rm=T)), samp.time, units = "days") / (365.25/12) -24
+      dt.cox$to.SP[which(dt.cox$patient.id == i)] <- 0
+    }else{
+      remove.pat <- append(remove.pat, i)
+    }
+  }else{
+    to.sp.date <- temp$to_sp[which(temp$patient.code == i)][1]
+    if(difftime(to.sp.date, samp.time) >= 0){
+      dt.cox$to.SP[which(dt.cox$patient.id == i)] <- 1
+      dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(to.sp.date, samp.time, units = "days") / (365.25/12) - 24
+    }else{
+      dt.cox$to.SP[which(dt.cox$patient.id == i)] <- 0
+      dt.cox$time[which(dt.cox$patient.id == i)] <- 0
+    }
+  }
+  
+}
+
+dt.cox <- dt.cox[-which(dt.cox$patient.id %in% remove.pat),]
+
+# Add PFAS and OH-PCB concentrations
+covariates <- colnames(dt.pfas)[1:20]
+dt.covariates <- dt.pfas[,1:20]
+
+
+patID <- unlist(unique(dt.cox$patient.id))
+fileNames <- c()
+for(i in 1:length(patID)){
+  j <- eims.smsreg.key$EIMS_1[which(eims.smsReg.id == patID[i])]
+  fileNames <- append(fileNames,
+                      eims.metadata$eims_filename[which(eims.metadata$EIMS_ID == j)])
+}
+
+dt.covariates <- dt.covariates[which(rownames(dt.covariates) %in% fileNames),]
+dt.covariates <- dt.covariates[match(fileNames, rownames(dt.covariates)),]
+
+dt.cox <- cbind(dt.cox, dt.covariates)
+dt.cox$collection.year <- as.numeric(dt.cox$collection.year)
+
+dt.cox[dt.cox == "-Inf"] <- NA
+dt.cox <- dt.cox[-which(dt.cox$time < 0),]
+dt.cox$treatment <- relevel(as.factor(dt.cox$treatment), ref = "No treatment") 
+```
+
+## Cox proportional hazard analysis - fully adjusted model
+```{r}
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, to.SP)~  sex + age + diag.samp.diff + BMI_curr + `', x, '` + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children')))
+
+
+envCont_mdl <- lapply(univ_formulas, function(x){coxph(x, data = dt.cox)})
+
+# Extract results 
+n = 5
+d = 3
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=d)
+                          coef<-signif(x$coef[n], digits=d)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = d)
+                          beta<-signif(x$coef[n], digits=d)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], d)
+                          HR.confint.upper <- signif(y$`upper .95`[n],d)
+                          res<-c(N, p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper)
+                          names(res)<-c("N", "p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper")
+                          return(res)
+                         })
+
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+write.csv(file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/CoxRegression/ToSP/FinalModel/cox.output.csv", res)
+
+# Forest plot
+ggsave(paste0(params$resultDir, "Imputed/CoxRegression/ToSP/FinalModel/forestplotAllComp.pdf"), 
+       forestPlotAllComp(res, digits = 3),
+       width = 8,
+       height = 6,
+       units = "in")
+```
+
+## Sensitivity analysis - Including treatment during FU-time
+```{r}
+dt.cox.FU.treatment <- dt.cox
+
+dt.cox.FU.treatment$FU_firstline <- 0
+dt.cox.FU.treatment$FU_secondline <- 0
+dt.cox.FU.treatment$FU_other <- 0
+
+for(i in dt.cox.FU.treatment$patient.id){
+  eims.id <- eims.smsreg.key$EIMS_1[which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)] 
+  if(length(which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)) == 0){
+    eims.id <- eims.metadata$EIMS_ID[which(unlist(lapply(eims.metadata$smsreg_id_payam_match, function(x) strsplit(x, "SMS")[[1]][2])) == i)]
+  }
+  pair.id <- eims.metadata$pairid[which(eims.metadata$EIMS_ID == eims.id)]
+  samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+  diag.date <- as.Date(temp$diagnosis_date[which(temp$patient.code == i)][1])
+  
+  # Progression and time
+  visits <- temp$visit_date[which(temp$patient.code == i)]
+  reorder <- order(visits, decreasing = F)
+  visits <- visits[reorder]
+  visit.diff <- unlist(lapply(visits, function(x) difftime(as.Date(x), samp.time, units = "days")/ (365.25/12)))
+  
+  first_line <- temp$first_line_DMT[which(temp$patient.code == i)][reorder]
+  second_line <- temp$second_line_DMT[which(temp$patient.code == i)][reorder]
+  other_treat <- temp$other_drugs[which(temp$patient.code == i)][reorder]
+  relaps_treat <- temp$relapse_treatment_drugs[which(temp$patient.code == i)][reorder]
+  stemcell <- temp$stem_cell_treatment[which(temp$patient.code == i)][reorder]
+  
+  if(length(which(first_line[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_firstline[which(dt.cox$patient.id == i)] <- 1
+  }
+  if(length(which(second_line[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_secondline[which(dt.cox$patient.id == i)] <- 1
+  }
+  if(length(which(other_treat[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_other[which(dt.cox$patient.id == i)] <- 1
+  }else if(length(which(relaps_treat[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_other[which(dt.cox$patient.id == i)] <- 1
+  }else if(length(which(stemcell[which(visit.diff > 0 & visit.diff <= dt.cox$time[which(dt.cox$patient.id == i)])] == 1)) > 0){
+    dt.cox.FU.treatment$FU_other[which(dt.cox$patient.id == i)] <- 1
+  }
+}
+
+dt.cox.FU.treatment$FU_firstline <- as.factor(dt.cox.FU.treatment$FU_firstline)
+dt.cox.FU.treatment$FU_secondline <- as.factor(dt.cox.FU.treatment$FU_secondline)
+dt.cox.FU.treatment$FU_other <- as.factor(dt.cox.FU.treatment$FU_other)
+```
+
+```{r Cox regression}
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, to.SP)~ `', x, '` + sex + age + diag.samp.diff + BMI_curr +  Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + FU_firstline + FU_secondline + FU_other')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.FU.treatment)})
+
+# Extract results 
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=3)
+                          coef<-signif(x$coef[n], digits=3)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 3)
+                          beta<-signif(x$coef[n], digits=3)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 3)
+                          HR.confint.upper <- signif(y$`upper .95`[n],3)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+write.csv(file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/CoxRegression/ToSP/FinalModel/cox.output.TreatmentDuringFU.csv", res)
+```
+
+## Sensitivity analysis - Including albumin concentrations
+```{r Add albumin concentrations}
+dt.cox.albumin <- dt.cox
+dt.cox.albumin$albumin <- NA
+for(i in 1:nrow(dt.cox)){
+pair.id <- dt.cox$pairID[i]
+barcode <- eims.metadata$Barcode[which(eims.metadata$pairid == pair.id & eims.metadata$MS == "m")]
+key <- alb.nyckel$`Sample ID Anders`[which(alb.nyckel$`sample ID CARAMBA` == barcode)]
+if(length(which(albumin$`Sample ID` == key)) == 1){
+  dt.cox.albumin$albumin[i] <- log2(as.numeric(albumin$albumin[which(albumin$`Sample ID` == key)]))
+}
+}
+```
+
+```{r Cox regression adjusted for albumin}
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, to.SP)~ `', x, '`  + sex + age + diag.samp.diff + BMI_curr +  Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + albumin')))
+
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.albumin)})
+
+# Extract results 
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=3)
+                          coef<-signif(x$coef[n], digits=3)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 3)
+                          beta<-signif(x$coef[n], digits=3)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 3)
+                          HR.confint.upper <- signif(y$`upper .95`[n],3)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+write.csv(file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/CoxRegression/ToSP/FinalModel/cox.output.albumin.csv", res)
+```
+
+
+# Spearman's rank correlation analysis
+```{r}
+dt.corr <- dt.pfas[,c(1:20)]
+colnames(dt.corr)
+corr.matrix <- rcorr(as.matrix(dt.corr), type = "spearman")
+
+fc <- as.matrix(corr.matrix$r)
+fcP <- as.matrix(corr.matrix$P)
+fcP <- as.matrix(corr.matrix$P)
+
+# Recalcualte all p-values with the value 0 manually
+for(i in 1:nrow(fcP)){
+  for(j in 1:ncol(fcP)){
+    if(is.na(fcP[i,j])){
+      next
+    }
+    else if(fcP[i,j] == 0){
+      h <- fc[i,j]
+      npair <- corr.matrix$n[i,j]
+      fcP[i,j] <- 2 * (pt(abs(h) * sqrt(npair - 2)/sqrt(pmax(1 -  h * h, 0)), npair - 2, lower.tail = F))
+    }
+  }
+}
+
+# Heatmap with p-value significe included
+## * p < 0.05; ** p < 0.01, *** p < 0.001
+class <- c(rep('short-chain PFAS', 3), 
+           rep("long-chain PFAS", 13), 
+           rep("FTS", 1), 
+           rep("OH-PCB", 3))
+
+ha1 = rowAnnotation(Class = class,
+                   col = list(Class = c("short-chain PFAS" = "#E8DA0C", 
+                                  "long-chain PFAS" = "#D47B09", 
+                                  "FTS" = "#0A682B",
+                                  "OH-PCB" = "#0EA998")),
+                       annotation_legend_param = list(Class = list(
+                       	ncol = 1, 
+                       	title = "Class", 
+                       	title_position = "topleft")),
+                   show_annotation_name = F,
+                   show_legend = T)
+
+ha2 <- HeatmapAnnotation(Class = class,
+                   col = list(Class = c("short-chain PFAS" = "#E8DA0C", 
+                                  "long-chain PFAS" = "#D47B09", 
+                                  "FTS" = "#0A682B",
+                                  "OH-PCB" = "#0EA998")),
+                       annotation_legend_param = list(Class = list(
+                       	ncol = 1, 
+                       	title = "Class", 
+                       	title_position = "topleft")),
+                   show_legend = F,
+                   show_annotation_name = F)
+
+nm <- colnames(fc)
+
+hxp.p <- Heatmap(fc, 
+        rect_gp = gpar(type = "none"),
+        column_dend_side = "bottom",
+        col = colorRamp2(c(-1, 0, 1), 
+        c("blue", "white", "red")), 
+        cell_fun = cell_fun_bottom,  
+        column_names_gp = grid::gpar(fontsize = 9),
+        row_names_gp = grid::gpar(fontsize = 9),
+        cluster_columns = T,
+        cluster_rows = T,
+        column_title = "", 
+        left_annotation = ha1,
+        bottom_annotation = ha2,
+        heatmap_legend_param = list(title = "r", 
+                                    title_gp = grid::gpar(fontface = "bold", 
+                                                          fontsize = 10)), 
+        show_heatmap_legend = T)
+
+pdf("~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/Correlation/All.pdf", width = 10, height = 8)
+draw(hxp.p)
+dev.off()
+
+## Heatmap with r values in cells
+hxp.r <- Heatmap(fc, 
+        rect_gp = gpar(type = "none"),
+        column_dend_side = "bottom",
+        col = colorRamp2(c(-1, 0, 1), 
+        c("blue", "white", "red")), 
+        cell_fun = cell_fun_bottom_r,  
+        column_names_gp = grid::gpar(fontsize = 9),
+        row_names_gp = grid::gpar(fontsize = 9),
+        cluster_columns = T,
+        cluster_rows = T,
+        column_title = "", 
+        left_annotation = ha1,
+        bottom_annotation = ha2,
+        heatmap_legend_param = list(title = "r", 
+                                    title_gp = grid::gpar(fontface = "bold", 
+                                                          fontsize = 10)), 
+        show_heatmap_legend = T)
+
+
+pdf("~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/Correlation/All.r.pdf", width = 10, height = 8)
+draw(hxp.r)
+dev.off()
+
+write.csv(file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/Correlation/All.P.csv", 
+          format(signif(fcP, digits = 3), scientific = T))
+write.csv(file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/Correlation/All.r.csv", 
+          round(fc, digits = 3))
+
+```
+
+# Vitamin D3
+```{r}
+dt.vitD3 <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/Metabolomics/VitaminD3/non.normalized.csv")
+rownames(dt.vitD3) <- dt.vitD3[,1]
+dt.vitD3 <- as.data.frame(dt.vitD3[,-1])
+dt.vitD3 <- dt.vitD3[rownames(dt.pfas),]
+names(dt.vitD3)[1] <- "vitD"
+
+# include metadata
+dt.vitD3$Sex <- dt.pfas$Sex
+dt.vitD3$Type <- dt.pfas$Type
+dt.vitD3$collection.year <- dt.pfas$collection.year
+dt.vitD3$Age <- dt.pfas$Age
+dt.vitD3$BMI_curr <- dt.pfas$BMI_curr
+dt.vitD3$BMI_20 <- dt.pfas$BMI_20
+dt.vitD3$years.reg.smoking <- dt.pfas$years.reg.smoking
+dt.vitD3$years.irreg.smoking <- dt.pfas$years.irreg.smoking
+dt.vitD3$years.passive.smoking <- dt.pfas$years.passive.smoking
+dt.vitD3$treatment <- dt.pfas$treatment
+dt.vitD3$pairID <- dt.pfas$pairID
+
+dt.sampling$collection.month <- lapply(dt.sampling$collectiondate, function(x) strsplit(as.character(x), "-")[[1]][2])
+dt.vitD3$collection.month <- NA
+for(i in 1:nrow(dt.vitD3)){
+  dt.vitD3$collection.month[i] <- dt.sampling$collection.month[which(dt.sampling$cdk == eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.vitD3)[i])])]
+}
+dt.vitD3$collection.month <- as.factor(unlist(dt.vitD3$collection.month))
+
+dt.vitD3$County <- dt.pfas$County
+dt.vitD3$pair.id <- dt.pfas$pairID
+for(i in unique(dt.vitD3$pair.id)){
+  dt.vitD3$County[which(dt.vitD3$pair.id == i & dt.vitD3$Type == "HC")] <- dt.vitD3$County[which(dt.vitD3$pair.id == i & dt.vitD3$Type %in% c("RR", "SP", "PP"))]
+}
+```
+
+## PFAS and OH-PCBs correlation with vitamin D3
+Spermans rank correlation analysis adjusting for collection month, sex, and number of biological children. Based on relative intensity data.
+
+```{r load intensity data}
+load("/Users/ainva234/Documents/Project/EIMS/Data/Environmental/Targeted/IntensityData.RData")
+dt.compounds <- dt.MS.HC
+```
+
+```{r select compounds}
+# Combine data
+pfas <- compound.info$Compound[which(compound.info$`Abbrev name` %in% colnames(dt.pfas)[1:20])]
+dt.corr <- dt.compounds[,which(colnames(dt.compounds) %in% pfas)]
+
+# Change to abbreviated names
+abbrev <- c()
+for(i in colnames(dt.corr)){
+  if(length(compound.info$`Abbrev name`[which(compound.info$Compound == i)]) == 0){
+    abbrev <- append(abbrev, i)
+  }else{
+   abbrev <- append(abbrev,
+                   compound.info$`Abbrev name`[which(compound.info$Compound == i)]) 
+  }
+}
+
+colnames(dt.corr) <- abbrev
+dt.corr <- dt.corr[,colnames(dt.pfas)[1:20]]
+dt.corr <- dt.corr[rownames(dt.pfas),]
+# Add vitamind D3
+dt.corr$vitD3 <- dt.vitD3$X25OH.VitD3..H2O
+
+# Sex, disease type and sample collection onth
+dt.corr$Sex <- dt.pfas$Sex
+dt.corr$Type <- dt.pfas$Type
+dt.corr$collection.month <- dt.vitD3$collection.month
+dt.corr$nr.children <- dt.pfas$nr.children
+dt.corr$nr.children <- as.factor(dt.corr$nr.children)
+
+# Impute
+for(i in 1:20){
+  dt.corr[which(is.na(dt.corr[,i])),i] <- log2(2^min(dt.corr[,i], na.rm=T)/2)
+}
+```
+
+```{r Adjust intensities for collection month and number of biological children - Females}
+# For correlations separated on males and females
+dt.corr.adjust.females <- dt.corr[which(dt.corr$Sex == "1"),]
+for(i in 1:21){
+  temp <- dt.corr.adjust.females[,c(i,22:25)]
+  temp$nr.children <- as.factor(temp$nr.children)
+  names(temp)[1] <- "compound"
+  mdl <- lm(compound ~ collection.month + nr.children, temp)
+  
+  anv <- car::Anova(mdl)
+  month_pval <- anv[1,"Pr(>F)"]
+  children_pval <- anv[2,"Pr(>F)"]
+  if(month_pval < 0.2){
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 2, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 2, i] - summary(mdl)$coefficients[2,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 3, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 3, i] - summary(mdl)$coefficients[3,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 4, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 4, i] - summary(mdl)$coefficients[4,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 5, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 5, i] - summary(mdl)$coefficients[5,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 6, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 6, i] - summary(mdl)$coefficients[6,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 7, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 7, i] - summary(mdl)$coefficients[7,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 8, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 8, i] - summary(mdl)$coefficients[8,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 9, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 9, i] - summary(mdl)$coefficients[9,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 10, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 10, i] - summary(mdl)$coefficients[10,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 11, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 11, i] - summary(mdl)$coefficients[11,1]
+    dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 12, i] <- dt.corr.adjust.females[dt.corr.adjust.females$collection.month == 12, i] - summary(mdl)$coefficients[12,1]
+  }
+  
+  if(children_pval < 0.2){
+    dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 1, i] <- dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 1, i] - summary(mdl)$coefficients[2,2]
+    dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 2, i] <- dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 2, i] - summary(mdl)$coefficients[3,2]
+    dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 3, i] <- dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 3, i] - summary(mdl)$coefficients[4,2]
+    dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 4, i] <- dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 4, i] - summary(mdl)$coefficients[5,2]
+    dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 5, i] <- dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 5, i] - summary(mdl)$coefficients[6,2]
+    dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 22, i] <- dt.corr.adjust.females[dt.corr.adjust.females$nr.children == 22, i] - summary(mdl)$coefficients[7,2]
+  }
+}
+
+dt.corr.adjust.females <- dt.corr.adjust.females[, -which(colnames(dt.corr.adjust.females) %in% c("collection.month", "nr.children"))]
+```
+
+```{r Adjust intensities for collection month - Males}
+# For correlations separated on males and females
+dt.corr.adjust <- dt.corr[which(dt.corr$Sex == "0"),]
+for(i in 1:21){
+  temp <- dt.corr.adjust[,c(i,22:25)]
+  names(temp)[1] <- "compound"
+  mdl <- lm(compound ~ collection.month, temp)
+  
+  anv <- car::Anova(mdl)
+  month_pval <- anv[1,"Pr(>F)"]
+  if(month_pval < 0.2){
+    dt.corr.adjust[dt.corr.adjust$collection.month == 2, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 2, i] - summary(mdl)$coefficients[2,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 3, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 3, i] - summary(mdl)$coefficients[3,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 4, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 4, i] - summary(mdl)$coefficients[4,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 5, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 5, i] - summary(mdl)$coefficients[5,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 6, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 6, i] - summary(mdl)$coefficients[6,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 7, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 7, i] - summary(mdl)$coefficients[7,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 8, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 8, i] - summary(mdl)$coefficients[8,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 9, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 9, i] - summary(mdl)$coefficients[9,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 10, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 10, i] - summary(mdl)$coefficients[10,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 11, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 11, i] - summary(mdl)$coefficients[11,1]
+    dt.corr.adjust[dt.corr.adjust$collection.month == 12, i] <- dt.corr.adjust[dt.corr.adjust$collection.month == 12, i] - summary(mdl)$coefficients[12,1]
+  }
+}
+
+dt.corr.adjust.males <- dt.corr.adjust[, -which(colnames(dt.corr.adjust) %in% c("collection.month"))]
+```
+
+```{r Adjust intensities for sex, collection month, and number of children - Males and Females}
+# For correlations where both males and femals are taken into account
+dt.corr.adjust.sex <- dt.corr
+for(i in 1:21){
+  temp <- dt.corr.adjust.sex[,c(i,22:25)]
+  temp$nr.children <- as.factor(temp$nr.children)
+  names(temp)[1] <- "compound"
+  mdl <- lm(compound ~ Sex + collection.month + nr.children, temp)
+  
+  anv <- car::Anova(mdl)
+  sex_pval <- anv[1,"Pr(>F)"]
+  month_pval <- anv[2,"Pr(>F)"]
+  children_pval <- anv[3,"Pr(>F)"]
+  
+  if(sex_pval < 0.2){
+    dt.corr.adjust.sex[dt.corr.adjust.sex$Sex == 0, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$Sex == 0, i] - summary(mdl)$coefficients[2,1]
+  }
+  
+  if(month_pval < 0.2){
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 2, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 2, i] - summary(mdl)$coefficients[3,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 3, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 3, i] - summary(mdl)$coefficients[4,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 4, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 4, i] - summary(mdl)$coefficients[5,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 5, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 5, i] - summary(mdl)$coefficients[6,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 6, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 6, i] - summary(mdl)$coefficients[7,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 7, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 7, i] - summary(mdl)$coefficients[8,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 8, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 8, i] - summary(mdl)$coefficients[9,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 9, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 9, i] - summary(mdl)$coefficients[10,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 10, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 10, i] - summary(mdl)$coefficients[11,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 11, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 11, i] - summary(mdl)$coefficients[12,1]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 12, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$collection.month == 12, i] - summary(mdl)$coefficients[13,1]
+  }
+  
+  if(children_pval < 0.2){
+    dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 1, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 1, i] - summary(mdl)$coefficients[2,3]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 2, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 2, i] - summary(mdl)$coefficients[3,3]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 3, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 3, i] - summary(mdl)$coefficients[4,3]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 4, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 4, i] - summary(mdl)$coefficients[5,3]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 5, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 5, i] - summary(mdl)$coefficients[6,3]
+    dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 22, i] <- dt.corr.adjust.sex[dt.corr.adjust.sex$nr.children == 22, i] - summary(mdl)$coefficients[7,3]
+  }
+}
+
+```
+
+```{r Correlations}
+# Correlation analysis 
+pfas.dvit.corr <- matrix(nrow = 20, ncol = 14)
+rownames(pfas.dvit.corr) <- colnames(dt.pfas)[1:20]
+colnames(pfas.dvit.corr) <- c("P", "r",
+                              "P.HC", "r.HC", "P.MS", "r.MS",
+                              "P.HC.F", "r.HC.F", "P.MS.F", "r.MS.F",
+                              "P.HC.M", "r.HC.M", "P.MS.M", "r.MS.M")
+
+# Correcaltion analysis inlcuding males and females, as well as both individuals with MS and HC
+corr.matrix <- rcorr(as.matrix(dt.corr.adjust.sex[,-which(colnames(dt.corr.adjust.sex) %in% c("Sex", "Type"))]), 
+                     type = "spearman")
+r <- as.matrix(corr.matrix$r)
+rP <- as.matrix(corr.matrix$P)
+for(i in 1:nrow(rP)){
+      for(j in 1:ncol(rP)){
+        if(is.na(rP[i,j])){
+          next
+        }
+        else if(rP[i,j] == 0){
+          h <- r[i,j]
+          npair <- corr.matrix$n[i,j]
+          rP[i,j] <- 2 * (pt(abs(h) * sqrt(npair - 2)/sqrt(pmax(1 -  h * h, 0)), npair - 2, lower.tail = F))
+        }
+      }
+    }
+pfas.dvit.corr[,1:2] <- cbind(rP[1:20, 21], r[1:20,21])
+
+# Correlatin analysis divided by MS and HC. Thre analysis were performed, males and females, as well as divided by sex.
+a <- 3
+for(sex in list(c(0,1), c(1), c(0))){
+  if(length(sex) == 2){
+    corr <- dt.corr.adjust.sex 
+  }else if(length(sex) == 1 & sex == 1){
+    corr <- dt.corr.adjust.females
+  }else if(length(sex) == 1 & sex == 0){
+    corr <- dt.corr.adjust.males
+  }
+  
+  for(type in list(c("HC"), c("RR", "SP", "PP"))){
+    corr.matrix <- rcorr(as.matrix(corr[which(corr$Type %in% type & corr$Sex %in% sex),
+                                       -which(colnames(corr) %in% c("Sex", "Type"))]), 
+                     type = "spearman")
+    r <- as.matrix(corr.matrix$r)
+    rP <- as.matrix(corr.matrix$P)
+    # Recalcualte all p-values with the value 0 manually
+    for(i in 1:nrow(rP)){
+      for(j in 1:ncol(rP)){
+        if(is.na(rP[i,j])){
+          next
+        }
+        else if(rP[i,j] == 0){
+          h <- r[i,j]
+          npair <- corr.matrix$n[i,j]
+          rP[i,j] <- 2 * (pt(abs(h) * sqrt(npair - 2)/sqrt(pmax(1 -  h * h, 0)), npair - 2, lower.tail = F))
+        }
+      }
+    }
+    pfas.dvit.corr[,c(a:(a+1))] <- cbind(rP[1:20, 21], r[1:20,21])
+    a <- a+2
+  }
+}
+```
+
+## Confirmed disability worsening analysis and transition from RRMS to SPMS
+```{r Extract samples with an EDSS within 3 months from sample collection}
+temp <- smsReg
+eims.smsReg.id <- unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2]))
+temp <- smsReg[which(smsReg$patient.code %in% eims.smsReg.id),]
+
+# Exclude visits with an edss = NA
+temp <- temp[-which(is.na(temp$edss.value.score)),]
+
+# Exclude patients with a closest visit more than 3 months from sample collection
+diff.visits <- c()
+for(i in unique(temp$patient.code)){
+  eims.id <- eims.smsreg.key$EIMS_1[which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)] 
+  if(length(which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)) == 0){
+    eims.id <- eims.metadata$EIMS_ID[which(unlist(lapply(eims.metadata$smsreg_id_payam_match, function(x) strsplit(x, "SMS")[[1]][2])) == i)]
+  }
+  samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+  
+  visits <- unlist(lapply(temp$visit_date[which(temp$patient.code == i)], function(x) difftime(as.Date(x), samp.time, units = "days")/ (365.25/12)))
+  diff.visits <- append(diff.visits, min(abs(visits), na.rm=T))
+}
+
+temp <- temp[-which(temp$patient.code %in% unique(temp$patient.code)[which(diff.visits > 3)]),] # 359 patients were excluded
+```
+
+```{r Prep data for cox regression}
+dt.cox <- data.frame(patient.id = eims.smsReg.id[which(eims.smsReg.id %in% temp$patient.code)],
+                        sex = unlist(lapply(eims.smsReg.id[which(eims.smsReg.id %in% temp$patient.code)], function(x) temp$sex[which(temp$patient.code == x)][1])))
+
+dt.cox$age <- NA
+dt.cox$time <- NA
+dt.cox$status <- NA
+dt.cox$collection.year <- NA
+dt.cox$diag.samp.diff <- NA
+dt.cox$BMI_20 <- NA
+dt.cox$BMI_curr <- NA
+dt.cox$Week <- NA
+dt.cox$years.reg.smoking <- NA
+dt.cox$years.irreg.smoking <- NA
+dt.cox$years.passive.smoking <- NA
+dt.cox$treatment <- NA
+dt.cox$edss.start <- NA 
+dt.cox$nr.children <- NA
+dt.cox$collection.month <- NA
+
+edss_startpoint <- c(0, 1.5, 5.5)
+edss_endpoint <- c(1.5, 5, 10)
+edss.diff.progress <- c(1.5, 1, 0.5)
+for(i in dt.cox$patient.id){
+  eims.id <- eims.smsreg.key$EIMS_1[which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)] 
+  if(length(which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)) == 0){
+    eims.id <- eims.metadata$EIMS_ID[which(unlist(lapply(eims.metadata$smsreg_id_payam_match, function(x) strsplit(x, "SMS")[[1]][2])) == i)]
+  }
+  pair.id <- eims.metadata$pairid[which(eims.metadata$EIMS_ID == eims.id)]
+  samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+  diag.date <- as.Date(temp$diagnosis_date[which(temp$patient.code == i)][1])
+  if(length(which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)) > 0){
+    dt.cox$collection.year[which(dt.cox$patient.id == i)] <- dt.pfas$collection.year[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$diag.samp.diff[which(dt.cox$patient.id == i)] <- dt.pfas$diag.samp.diff[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$BMI_20[which(dt.cox$patient.id == i)] <- dt.pfas$BMI_20[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$BMI_curr[which(dt.cox$patient.id == i)] <- dt.pfas$BMI_curr[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$age[which(dt.cox$patient.id == i)] <- dt.pfas$Age[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$Week[which(dt.cox$patient.id == i)] <- dt.pfas$Week[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.reg.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.reg.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.irreg.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.irreg.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.passive.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.passive.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$treatment[which(dt.cox$patient.id == i)] <- dt.pfas$treatment[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$nr.children[which(dt.cox$patient.id == i)] <- dt.pfas$nr.children[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$collection.month[which(dt.cox$patient.id == i)] <- dt.vitD3$collection.month[which(!(dt.vitD3$Type == "HC") & dt.vitD3$pairID == pair.id)]
+  }
+  # Progression and time
+  visits <- temp$visit_date[which(temp$patient.code == i)]
+  reorder <- order(visits, decreasing = F)
+  visits <- visits[reorder]
+  visit.diff <- unlist(lapply(visits, function(x) difftime(as.Date(x), samp.time, units = "days")/ (365.25/12)))
+  edss.visits <- temp$edss.value.score[which(temp$patient.code == i)][reorder]
+  closest.visit <- which(abs(visit.diff) == min(abs(visit.diff), na.rm=T))
+  
+  n = 1
+  if(edss.visits[closest.visit] >= edss_startpoint[3]){
+    n = 3
+  }else if(edss.visits[closest.visit] >= edss_startpoint[2]){
+    n = 2
+  }
+  
+  if(length(visits) == 1){ # Censur where only one visit has occured
+    dt.cox$status[which(dt.cox$patient.id == i)] <- 0
+    dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[1]), samp.time, units = "days") / (365.25/12)
+    dt.cox$edss.start[which(dt.cox$patient.id == i)] <- edss.visits
+  }else if(edss.visits[closest.visit] <= edss_endpoint[n]){ # If the edss is > edds_startpoint & < edss_endpoint -> check for progression
+    edss.diff <- unlist(lapply(edss.visits[(closest.visit+1):length(edss.visits)],
+                               function(x) x - edss.visits[closest.visit]))
+    p <- which(edss.diff >= edss.diff.progress[n])
+    dt.cox$edss.start[which(dt.cox$patient.id == i)] <- edss.visits[closest.visit]
+    if(length(p) <= 1){# if p is NA or 1 -> no progression 
+      dt.cox$status[which(dt.cox$patient.id == i)] <- 0
+      dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[length(visits)]), samp.time, units = "days") / (365.25/12)
+    }else if(length(p) == length(edss.diff)){ # if all edss.diff shows progression and it is more than 3 months between first p and last p add the progression
+      if(visit.diff[length(p)+closest.visit] - visit.diff[closest.visit] >= 3){
+        dt.cox$status[which(dt.cox$patient.id == i)] <- 1
+        dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[closest.visit+p[1]]), samp.time, units = "days") / (365.25/12)
+      }else{
+        dt.cox$status[which(dt.cox$patient.id == i)] <- 0
+        dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[length(visits)]), samp.time, units = "days") / (365.25/12)
+      }
+    }else if(length(p) > 1){ # Check if the progress is heald for 3 months
+      for(j in p){
+        if(closest.visit+j < length(visits)){
+          if(edss.visits[closest.visit+j+1] - edss.visits[closest.visit] >= edss.diff.progress[n]){
+            if(visit.diff[1+j+closest.visit] - visit.diff[j+closest.visit] >= 3){
+              dt.cox$status[which(dt.cox$patient.id == i)] <- 1
+              dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[closest.visit+j]), samp.time, units = "days") / (365.25/12)
+              break
+            }
+          }
+        }
+      }
+      if(is.na(dt.cox$time[which(dt.cox$patient.id == i)])){
+        dt.cox$status[which(dt.cox$patient.id == i)] <- 0
+        dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(visits[length(visits)]), samp.time, units = "days") / (365.25/12)
+      }
+    }
+  }
+}
+
+# Add Type, collection month and vitamin D3 levels
+dt.cox$Type <- NA
+for(i in 1:nrow(dt.cox)){
+  if(length(dt.pfas$Type[which(rownames(dt.pfas) %in% eims.metadata$eims_filename[which(eims.metadata$EIMS_ID %in% eims.smsreg.key$EIMS_1[which(eims.smsreg.key$Register.Id %in% paste0("SMS",dt.cox$patient.id[i]))])])]) > 0){
+    dt.cox$Type[i] <- dt.pfas$Type[which(rownames(dt.pfas) %in% eims.metadata$eims_filename[which(eims.metadata$EIMS_ID %in% eims.smsreg.key$EIMS_1[which(eims.smsreg.key$Register.Id %in% paste0("SMS",dt.cox$patient.id[i]))])])]
+    dt.cox$`25OH-VitD3`[i] <- dt.vitD3$X25OH.VitD3..H2O[which(rownames(dt.vitD3) %in% eims.metadata$eims_filename[which(eims.metadata$EIMS_ID %in% eims.smsreg.key$EIMS_1[which(eims.smsreg.key$Register.Id %in% paste0("SMS",dt.cox$patient.id[i]))])])]
+  }
+} 
+
+dt.cox$collection.year <- as.numeric(dt.cox$collection.year)
+dt.cox$Type[which(dt.cox$Type %in% c("SP", "PP"))] <- "PMS"                               
+dt.cox$Type <- relevel(as.factor(dt.cox$Type), ref = "RR")
+dt.cox$treatment <- relevel(as.factor(dt.cox$treatment), ref = "No treatment")    
+```
+
+### Vitamin D3 association with confirmed disability worsening
+```{r Cox regression}
+# Model for males and females together
+univ_formulas <- sapply(c("25OH-VitD3"),
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + sex + age + diag.samp.diff + BMI_curr + Week + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + collection.month + edss.start')))
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox)})
+
+# Model for males only
+dt.cox.sex <- dt.cox[which(dt.cox$sex == "MAN"),]
+univ_formulas <- sapply(c("25OH-VitD3"),
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + diag.samp.diff + BMI_curr + Week + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + collection.month + edss.start')))
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Model for females only
+dt.cox.sex <- dt.cox[which(dt.cox$sex == "WOMAN"),]
+univ_formulas <- sapply(c("25OH-VitD3"),
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + diag.samp.diff + BMI_curr + Week + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + collection.month + edss.start')))
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Extract results 
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=3)
+                          coef<-signif(x$coef[n], digits=3)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 3)
+                          beta<-signif(x$coef[n], digits=3)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 3)
+                          HR.confint.upper <- signif(y$`upper .95`[n],3)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+res_final <- matrix(NA, ncol = 7, nrow = 0) # Initiate the summarise result matrix
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+res_final <- rbind(res_final, res)
+rownames(res_final) <- c("Males and Females", "Females", "Males")
+```
+
+```{r Forest plot}
+digits = 3
+data <- tibble(Compound = rownames(res_final),
+                 p.value = res_final$p.value,
+                 mean = res_final$`hazard ratio`,
+                 lower = res_final$HR.confint.lower,
+                 upper = res_final$HR.confint.upper,
+                 N = res_final$N)
+
+  # Number of digits shown 
+  data$p.value <- signif(data$p.value, digits = digits)
+  data$mean <- signif(data$mean, digits = digits)
+  data$lower <- signif(data$lower, digits = digits)
+  data$upper <- signif(data$upper, digits = digits)
+  
+  for(i in 1:nrow(data)){
+    if(data$p.value[i] < 0.01){
+      data$p.value[i] <- format(as.numeric(data$p.value[i]), scientific = T)
+    }
+  }
+  
+  data$conf.int <- NA
+  for(i in 1:nrow(data)){
+    data$conf.int[i] <- paste0(data$lower[i], "-", data$upper[i])
+  }
+  
+  data <- rbind(rep(NA,7), data)
+  
+  data$colour <- rep(c("white", "gray95"), nrow(data)/2)
+  p <- ggplot(data, aes(x = mean, y = Compound, xmin = lower, xmax = upper)) +
+    geom_hline(aes(yintercept = Compound, colour = colour), size = 7) + 
+    geom_pointrange(shape = 22, fill = "black") +
+    geom_vline(xintercept = 1, linetype = 3) +
+    xlab("Hazard ratio (95% CI)") +
+    ylab("") +
+    theme_classic() +
+    scale_colour_identity() +
+    scale_y_discrete(limits = rev(data$Compound)) +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank())
+  
+  fplottable  <- data[-1,c(1,6,2)]
+  fplottable <- rbind(c("Compound", "N", "P"),
+                      fplottable)
+  fplottable$`Hazard ratio (95% CI)` <- c("Hazard ratio",
+                                          unlist(lapply(data$Compound[-1], function(x) paste0(data$mean[which(data$Compound == x)], " (", data$lower[which(data$Compound == x)], "-", data$upper[which(data$Compound == x)], ")"))))
+  fplottable$color <- c("white", unlist(lapply(data$Compound[-1], function(x) data$colour[which(data$Compound == x)])))
+  fplottable$Compound <- factor(fplottable$Compound, levels = fplottable$Compound)
+  
+  
+  data_table <- ggplot(data = fplottable, aes(y = Compound)) +
+    geom_hline(aes(yintercept = Compound, colour = color), size = 5) +
+    geom_text(aes(x = 0, label = Compound), hjust = 0) +
+    geom_text(aes(x = 5, label = p.value)) +
+    geom_text(aes(x = 9, label = `Hazard ratio (95% CI)`), hjust = 1) +
+    scale_colour_identity() +
+    scale_y_discrete(limits = rev(fplottable$Compound)) +
+    theme_void() + 
+    theme(plot.margin = margin(5, 0, 35, 0)) 
+  
+  
+  ggsave("/Users/ainva234/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/VitD/Raw/cox.pdf", 
+       grid.arrange(as.grob(data_table), as.grob(p), ncol = 2),
+       width = 8,
+       height = 2,
+       units = "in")
+
+write.csv(res_final, "/Users/ainva234/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/VitD/Raw/cox.csv")  
+```
+
+### PFAS and OH-PCBs association with confirmed disability worsening ajdusted for vitamin D3
+```{r Add PFAS concentrations}
+covariates <- colnames(dt.pfas)[1:20]
+dt.covariates <- dt.pfas[,1:20]
+colnames(dt.covariates) <- covariates
+
+patID <- unlist(unique(dt.cox$patient.id))
+fileNames <- c()
+for(i in 1:length(patID)){
+  j <- eims.smsreg.key$EIMS_1[which(eims.smsReg.id == patID[i])]
+  fileNames <- append(fileNames,
+                      eims.metadata$eims_filename[which(eims.metadata$EIMS_ID == j)])
+}
+
+dt.covariates <- dt.covariates[which(rownames(dt.covariates) %in% fileNames),]
+dt.covariates <- dt.covariates[match(fileNames, rownames(dt.covariates)),]
+
+dt.cox.pfas <- cbind(dt.cox, dt.covariates)
+dt.cox.pfas$`25OH-VitD3` <- dt.cox$`25OH-VitD3`
+```
+
+```{r Cox proportional hazard analysis}
+# Model for males and females together
+univ_formulas <- sapply(covariates,
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + sex + age + diag.samp.diff + BMI_curr + Week + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + collection.month + `25OH-VitD3` + edss.start + nr.children')))
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.pfas)})
+
+# Model for males only
+dt.cox.sex <- dt.cox.pfas[which(dt.cox.pfas$sex == "MAN"),]
+univ_formulas <- sapply(covariates,
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + diag.samp.diff + BMI_curr + Week + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + collection.month + `25OH-VitD3` + edss.start')))
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Model for females only
+dt.cox.sex <- dt.cox.pfas[which(dt.cox.pfas$sex == "WOMAN"),]
+univ_formulas <- sapply(covariates,
+                        function(x) as.formula(paste0('Surv(time, status)~ `', x, '` + age + diag.samp.diff + BMI_curr + Week + Type + treatment + years.reg.smoking + years.irreg.smoking + years.passive.smoking + collection.month + `25OH-VitD3` + edss.start + nr.children')))
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox.sex)})
+
+# Extract model results 
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=4)
+                          coef<-signif(x$coef[n], digits=4)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 4)
+                          beta<-signif(x$coef[n], digits=4)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 4)
+                          HR.confint.upper <- signif(y$`upper .95`[n],4)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+
+write.csv(as.data.frame(round(res, digits=3)),
+          "/Users/ainva234/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/CoxRegression/EDSS/AdjustVitD3/Cox.output.csv")
+
+# Forest plot
+pdf(file = paste0(params$resultDir, "Imputed/CoxRegression/EDSS/AdjustVitD3/Forestplot.pdf"))
+forestPlotAllComp(res, digits = 3)
+dev.off()
+```
+
+## Transition RRMS to SPMS
+```{r Extract the data fro Cox proportional hazard analysis for RRMS to SPMS transition analysis}
+temp <- smsReg
+eims.smsReg.id <- unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2]))
+temp <- temp[which(temp$patient.code %in% eims.smsReg.id),]
+
+# Timepoint 0 = sampling timepoint
+# End timpoint = SP diagnosis or last visit
+
+dt.cox <- data.frame(patient.id = eims.smsReg.id[which(eims.smsReg.id %in% temp$patient.code)],
+                        sex = unlist(lapply(eims.smsReg.id[which(eims.smsReg.id %in% temp$patient.code)], function(x) temp$sex[which(temp$patient.code == x)][1])))
+
+dt.cox$age <- NA
+dt.cox$time <- NA
+dt.cox$to.SP <- NA
+dt.cox$collection.year <- NA
+dt.cox$diag.samp.diff <- NA
+dt.cox$BMI_20 <- NA
+dt.cox$BMI_curr <- NA
+dt.cox$Week <- NA
+dt.cox$treatment <- NA
+dt.cox$years.reg.smoking <- NA
+dt.cox$years.irreg.smoking <- NA
+dt.cox$years.passive.smoking <- NA
+dt.cox$nr.children <- NA
+dt.cox$vitD <- NA
+dt.cox$collection.month <- NA
+
+remove.pat <- c() # Exclude patients taht already were SP at sampling
+for(i in dt.cox$patient.id){
+  eims.id <- eims.smsreg.key$EIMS_1[which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)] 
+  if(length(which(unlist(lapply(eims.smsreg.key$Register.Id, function(x) strsplit(x, "SMS")[[1]][2])) == i)) == 0){
+    eims.id <- eims.metadata$EIMS_ID[which(unlist(lapply(eims.metadata$smsreg_id_payam_match, function(x) strsplit(x, "SMS")[[1]][2])) == i)]
+  }
+  pair.id <- eims.metadata$pairid[which(eims.metadata$EIMS_ID == eims.id)]
+  samp.time <- as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.id)])
+  diag.date <- as.Date(temp$diagnosis_date[which(temp$patient.code == i)][1])
+  if(length(which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)) > 0){
+    dt.cox$collection.year[which(dt.cox$patient.id == i)] <- dt.pfas$collection.year[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$diag.samp.diff[which(dt.cox$patient.id == i)] <- dt.pfas$diag.samp.diff[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$BMI_20[which(dt.cox$patient.id == i)] <- dt.pfas$BMI_20[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$BMI_curr[which(dt.cox$patient.id == i)] <- dt.pfas$BMI_curr[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$age[which(dt.cox$patient.id == i)] <- dt.pfas$Age[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$Week[which(dt.cox$patient.id == i)] <- dt.pfas$Week[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.reg.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.reg.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.irreg.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.irreg.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$years.passive.smoking[which(dt.cox$patient.id == i)] <- dt.pfas$years.passive.smoking[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$treatment[which(dt.cox$patient.id == i)] <- dt.pfas$treatment[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$nr.children[which(dt.cox$patient.id == i)] <- dt.pfas$nr.children[which(!(dt.pfas$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$vitD[which(dt.cox$patient.id == i)] <- dt.vitD3$vitD[which(!(dt.vitD3$Type == "HC") & dt.pfas$pairID == pair.id)]
+    dt.cox$collection.month[which(dt.cox$patient.id == i)] <- dt.vitD3$collection.month[which(!(dt.vitD3$Type == "HC") & dt.pfas$pairID == pair.id)]
+  }
+  # To SP
+  if(temp$to_sp[which(temp$patient.code == i)][1] == ""){
+    if(temp$progress[which(temp$patient.code == i)][1] == "RR - Intermittent progressive MS"){
+      visits <- temp$visit_date[which(temp$patient.code == i)]
+      dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(as.Date(max(visits,na.rm=T)), samp.time, units = "days") / (365.25/12) -24
+      dt.cox$to.SP[which(dt.cox$patient.id == i)] <- 0
+    }else{
+      remove.pat <- append(remove.pat, i)
+    }
+  }else{
+    to.sp.date <- temp$to_sp[which(temp$patient.code == i)][1]
+    if(difftime(to.sp.date, samp.time) >= 0){
+      dt.cox$to.SP[which(dt.cox$patient.id == i)] <- 1
+      dt.cox$time[which(dt.cox$patient.id == i)] <- difftime(to.sp.date, samp.time, units = "days") / (365.25/12) - 24
+    }else{
+      dt.cox$to.SP[which(dt.cox$patient.id == i)] <- 0
+      dt.cox$time[which(dt.cox$patient.id == i)] <- 0
+    }
+  }
+  
+}
+
+dt.cox <- dt.cox[-which(dt.cox$patient.id %in% remove.pat),]
+
+# Add concentrations
+covariates <- colnames(dt.pfas)[1:(ncol(dt.pfas)-rm.col)]
+dt.covariates <- dt.pfas[,1:(ncol(dt.pfas)-rm.col)]
+
+
+patID <- unlist(unique(dt.cox$patient.id))
+fileNames <- c()
+for(i in 1:length(patID)){
+  j <- eims.smsreg.key$EIMS_1[which(eims.smsReg.id == patID[i])]
+  fileNames <- append(fileNames,
+                      eims.metadata$eims_filename[which(eims.metadata$EIMS_ID == j)])
+}
+
+dt.covariates <- dt.covariates[which(rownames(dt.covariates) %in% fileNames),]
+dt.covariates <- dt.covariates[match(fileNames, rownames(dt.covariates)),]
+
+dt.cox <- cbind(dt.cox, dt.covariates)
+dt.cox$collection.year <- as.numeric(dt.cox$collection.year)
+
+# Add disease phenotype
+dt.cox$Type <- NA
+for(i in 1:nrow(dt.cox)){
+  if(length(dt.pfas$Type[which(rownames(dt.pfas) %in% eims.metadata$eims_filename[which(eims.metadata$EIMS_ID %in% eims.smsreg.key$EIMS_1[which(eims.smsreg.key$Register.Id %in% paste0("SMS",dt.cox$patient.id[i]))])])]) > 0){
+    dt.cox$Type[i] <- dt.pfas$Type[which(rownames(dt.pfas) %in% eims.metadata$eims_filename[which(eims.metadata$EIMS_ID %in% eims.smsreg.key$EIMS_1[which(eims.smsreg.key$Register.Id %in% paste0("SMS",dt.cox$patient.id[i]))])])]
+  }
+} 
+
+dt.cox <- dt.cox[-which(dt.cox$time < 0),]
+dt.cox$Type <- relevel(as.factor(dt.cox$Type), ref = "RR")
+dt.cox$treatment <- relevel(as.factor(dt.cox$treatment), ref = "No treatment") 
+```
+
+### Vitamin D association with risk for transitioning from RRMS to SPMS
+```{r Cox proportional hazard analysis}
+univ_formulas <- sapply(c("vitD"),
+                        function(x) as.formula(paste0('Surv(time, to.SP) ~', x, ' + sex + age + diag.samp.diff + BMI_curr + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + vitD + collection.month')))
+envCont_mdl <- lapply( univ_formulas, function(x){coxph(x, data = dt.cox)})
+
+# Extract model results 
+n = 1
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-signif(x$`Pr(>|z|)`[n], digits=3)
+                          coef<-signif(x$coef[n], digits=3)
+                          exp.coeff <- signif(x$`exp(coef)`[n], digits = 3)
+                          beta<-signif(x$coef[n], digits=3)#coeficient beta
+                          HR.confint.lower <- signif(y$`lower .95`[n], 3)
+                          HR.confint.upper <- signif(y$`upper .95`[n],3)
+                          res<-c(p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper, N)
+                          names(res)<-c("p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper", "N")
+                          return(res)
+                         })
+
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+```
+
+### PFAS and OH-PCBs association with risk for transitioning from RRMS to SPMS adjusting for vitamin D3
+```{r Cox proportional hazard analysis}
+univ_formulas <- sapply(covariates[1:20],
+                        function(x) as.formula(paste0('Surv(time, to.SP)~  sex + age + diag.samp.diff + BMI_curr + `', x, '` + Week + years.reg.smoking + years.irreg.smoking + years.passive.smoking + treatment + nr.children + vitD + collection.month')))
+envCont_mdl <- lapply(univ_formulas, function(x){coxph(x, data = dt.cox)})
+
+# Extract data 
+n = 5
+d = 3
+envCont_results <- lapply(envCont_mdl,
+                       function(x){ 
+                          N <- x$n
+                          y <- as.data.frame(summary(x)[["conf.int"]])
+                          x <- as.data.frame(summary(x)[["coefficients"]])
+                          p.value<-round(x$`Pr(>|z|)`[n], digits=d)
+                          coef<-round(x$coef[n], digits=d)
+                          exp.coeff <- round(x$`exp(coef)`[n], digits = d)
+                          beta<-round(x$coef[n], digits=d)#coeficient beta
+                          HR.confint.lower <- round(y$`lower .95`[n], d)
+                          HR.confint.upper <- round(y$`upper .95`[n],d)
+                          res<-c(N, p.value, coef, exp.coeff, beta, HR.confint.lower, HR.confint.upper)
+                          names(res)<-c("N", "p.value", "coeff", "hazard ratio", "beta", "HR.confint.lower", "HR.confint.upper")
+                          return(res)
+                         })
+
+res <- as.data.frame(t(as.data.frame(envCont_results, check.names = FALSE)))
+write.csv(file = "~/Documents/Project/EIMS/Results/Environmental/Targeted/PFAS/Concentrations/Imputed/CoxRegression/ToSP/FinalModel/vitD.cox.output.csv", res)
+
+# Forest plot
+ggsave(paste0(params$resultDir, "Imputed/CoxRegression/ToSP/FinalModel/vitD.forestplot.pdf"), 
+       forestPlotAllComp(res, digits = 3),
+       width = 8,
+       height = 6,
+       units = "in")
+```

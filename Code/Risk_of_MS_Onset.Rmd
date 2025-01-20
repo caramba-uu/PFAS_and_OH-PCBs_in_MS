@@ -1,0 +1,732 @@
+---
+title: "SNP_PFAS_riskanalysis"
+author: "Aina Vaivade"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    fig_caption: yes
+params:
+  resultDir: '/Users/ainva234/Documents/Project/EIMS/Results/Environmental/Targeted/Genes*PFAS/'
+  emisColestVisit: '/Users/ainva234/Documents/Project/EIMS/Data/EIMS_closest_visit.csv'
+  eimsSMSReg: '/Users/ainva234/Documents/Project/EIMS/Data/SMSRegData/EIMS_Criteria_smsreg_incl_drugs.csv'
+  dataDir: '/Users/ainva234/Documents/Project/EIMS/Data/'
+  funcFile: '/Users/ainva234/Documents/Project/EIMS/Code/functions.R'
+  samplingData: '/Users/ainva234/Documents/Project/EIMS/Data/EIMS_collection.xlsx'
+  lifeStyle: "~/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_LifestyleExposures.txt"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      messeges = FALSE)
+```
+
+```{r Libraries}
+# Load libraries
+install.packages("readxl")
+install.packages("lme4")
+install.packages("car")
+install.packages("dplyr")
+install.packages("purrr")
+
+library(readxl)
+library(lme4)
+library(car)
+library(dplyr)
+library(purrr)
+```
+
+```{r Load data}
+source(params$funcFile)
+
+load(paste0(params$dataDir, "Environmental/Targeted/PFAS/dt.pfas.20cov.RData"))
+dt.closest.visit <- read.csv(params$emisColestVisit)
+eims.metadata <- read.csv(paste0(params$dataDir, "collated_eims_metadata.csv"))
+eims.smsreg.key <- read_excel(paste0(params$dataDir, "SMS_reg_inclEIMS.xlsx"))
+smsReg <- read.csv(params$eimsSMSReg)
+compound.info <- read_excel(paste0(params$dataDir, 'Environmental/ENV_TARGETED_COMPOUNDS_INFO.xlsx'))
+runorder <- read_excel(paste0(params$dataDir, "Environmental/FinalRunOrderEIMS_Enviro2022.xlsx"), sheet = "Runorder")
+dt.sampling <- read_excel(params$samplingData)
+dt.lifeStyle <- read.csv(params$lifeStyle, sep = "\t")
+dt.children <- read_excel(paste0(params$dataDir, "/survey_data/documents_20240419/children.xls"))
+snp.data <- read_excel(paste0(params$dataDir, "SNP/Burman_MSrisk_230205.xlsx"))
+
+dt.pfas <- dt.cov
+```
+
+# Order accordingly size (number of C)
+```{r order data to same order}
+colnames(dt.pfas)[which(colnames(dt.pfas) == "PFHps")] <- "PFHpS"
+colnames(dt.pfas)[which(colnames(dt.pfas) == "PCB 187")] <- "4-OH-CB187"
+colnames(dt.pfas)[which(colnames(dt.pfas) == "PCB 153")] <- "3-OH-CB153"
+colnames(dt.pfas)[which(colnames(dt.pfas) == "4-Hydroxy-PCB 106")] <- "4-OH-CB107"
+
+order <- c("PFBS", "PFPeS", "PFHpA",
+           "PFHxS", "PFHpS", "PFOA",
+           "PFOS", "FOSA", "N-MeFOSAA",
+           "N-EtFOSAA", "PFNA", "PFDA",
+           "PFDS", "PFUnA", "PFDoA",
+           "PFTrDA", "8:2 FTS", "4-OH-CB187",
+           "3-OH-CB153", "4-OH-CB107",
+           "Type", "pairID", "Age",
+           "Sex", "YOB", "County",
+           "Week", "time.diff.sampling",
+           "diag.samp.diff", "BMI_20", "BMI_curr")
+
+dt.pfas <- dt.pfas[,order]
+```
+
+```{r Impute NA or negative values}
+dt.pfas.imp <- dt.pfas
+dt.pfas.imp[,1:20] <- 2^dt.pfas.imp[,1:20]
+
+# Impute !/2 in vaue for NA and negative values
+for(i in 1:20){
+  if(length(which(dt.pfas.imp[,i] < 0)) > 0){
+    dt.pfas.imp[which(dt.pfas.imp[,i] < 0),i] <- NA
+  }
+  low.val <- min(dt.pfas.imp[,i], na.rm=T)
+  dt.pfas.imp[which(is.na(dt.pfas.imp[,i])),i] <- low.val/2
+  dt.pfas.imp[,i] <- log(dt.pfas.imp[,i], base = 2)
+}
+
+dt.pfas <- dt.pfas.imp
+```
+
+# Include Lifestyle data
+  - Reegular smoking
+  - Passive smoking
+  - Irregular smoking
+  - Swedish snuff
+  - Mono infection
+  - Alcohol consumption
+  - Number of childbirths
+  - Sun-habits 
+  - Residential area
+  - Born in Sweden or other Nordic countries
+
+```{r lifestyle data}
+dt.pfas$collection.year <- NA
+
+for(i in rownames(dt.pfas)){
+  dt.pfas$collection.year[which(rownames(dt.pfas) == i)] <- format(as.Date(dt.sampling$collectiondate[which(dt.sampling$cdk == eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == i)])]), "%Y")
+}
+
+# Set an index date which
+## The index date is the same as diagnosis date, and for HC the index date is the diagnosis date of their matched MS subject
+dt.pfas$index.date <- NA
+for(i in 1:nrow(dt.pfas)){
+  if(dt.pfas$Type[i]!= "HC"){
+    eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+    pat.code <- as.numeric(strsplit(eims.smsreg.key$Register.Id[which(eims.smsreg.key$EIMS_1 == eims.id)], "SMS")[[1]][2])
+    temp <- smsReg %>% filter(patient.code == pat.code)
+    diag.date <- temp$diagnosis_date
+    if(!is.na(min(as.Date(diag.date)))){
+      dt.pfas$index.date[i] <- as.character(min(as.Date(diag.date)))
+    }else{ #If diagnosis date is NA, the debute date is used
+      dt.pfas$index.date[i] <- as.character(min(as.Date(temp$debut_date)))
+    }
+  }
+}
+
+for(i in 1:nrow(dt.pfas)){
+  if(dt.pfas$Type[i] == "HC"){
+    dt.pfas$index.date[i] <- dt.pfas$index.date[which(dt.pfas$pairID == dt.pfas$pairID[i] & dt.pfas$Type != "HC")]
+  }
+}
+
+# Include regular smoking
+dt.lifestyle <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_LifestyleExposures.csv", sep = ";")
+dt.smoking <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_regularSmoke.csv", sep = ";")
+
+dt.pfas$reg.smoking <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$neverSmoke[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$reg.smoking[i] <- NA
+  }else if(dt.lifestyle$neverSmoke[which(dt.lifestyle$EIMS == eims.id)] == 2){ #Never smoked
+      dt.pfas$reg.smoking[i] <- 0
+  }else{ #Smoker or has been. Check if the individual was a smoker at or prior to the index year
+      smoking <- dt.smoking[which(dt.smoking$EIMS == eims.id),]
+      start.smoking.age <- min(smoking$fromAge)
+      if(!is.na(start.smoking.age)){
+        sample.coll.year <- eims.metadata$year[which(eims.metadata$EIMS_ID == eims.id)]
+        start.smoking.year <- sample.coll.year - (dt.pfas$Age[i] - start.smoking.age)
+        if(is.na(dt.pfas$index.date[i])){
+          dt.pfas$reg.smoking[i] <- NA
+        }else if(as.numeric(start.smoking.year) <= as.numeric(format(as.Date(dt.pfas$index.date[i]), "%Y"))){
+          end.smoking.age <- max(smoking$toAge)
+          if(is.na(end.smoking.age)){
+            dt.pfas$reg.smoking[i] <- 1
+          }else if(end.smoking.age >= dt.pfas$Age[i]){
+            dt.pfas$reg.smoking[i] <- 1
+          }else{
+            dt.pfas$reg.smoking[i] <- 0
+          }
+        }else{
+          dt.pfas$reg.smoking[i] <- 0
+        }
+      }else{
+        dt.pfas$reg.smoking[i] <- NA
+      }
+  }
+}
+
+dt.pfas$reg.smoking <- relevel(as.factor(dt.pfas$reg.smoking), ref = "0")
+rm(dt.smoking)
+
+# Include irregular smoking
+dt.smoking <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_irregSmoke.csv", sep = ";")
+
+dt.pfas$irreg.smoking <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$irregSmoke[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$irreg.smoking[i] <- NA
+  }else if(dt.lifestyle$irregSmoke[which(dt.lifestyle$EIMS == eims.id)] == 1){ #Never smoked
+      dt.pfas$irreg.smoking[i] <- 0
+  }else{ #Smoker or has been. Check if the individual was a smoker at or prior to the index year
+      smoking <- dt.smoking[which(dt.smoking$EIMS == eims.id),]
+      start.smoking.age <- min(smoking$fromAge)
+      if(!is.na(start.smoking.age)){
+        sample.coll.year <- eims.metadata$year[which(eims.metadata$EIMS_ID == eims.id)]
+        start.smoking.year <- sample.coll.year - (dt.pfas$Age[i] - start.smoking.age)
+        if(is.na(dt.pfas$index.date[i])){
+          dt.pfas$irreg.smoking[i] <- NA
+        }else if(as.numeric(start.smoking.year) <= as.numeric(format(as.Date(dt.pfas$index.date[i]), "%Y"))){
+          end.smoking.age <- max(smoking$toAge)
+          if(is.na(end.smoking.age)){
+            dt.pfas$irreg.smoking[i] <- 1
+          }else if(end.smoking.age >= dt.pfas$Age[i]){
+            dt.pfas$irreg.smoking[i] <- 1
+          }else{
+            dt.pfas$irreg.smoking[i] <- 0
+          }
+        }else{
+          dt.pfas$irreg.smoking[i] <- 0
+        }
+      }else{
+        dt.pfas$irreg.smoking[i] <- NA
+      }
+  }
+}
+
+dt.pfas$irreg.smoking <- relevel(as.factor(dt.pfas$irreg.smoking), ref = "0")
+rm(dt.smoking)
+
+# Include passive smoking (sum work and home)
+dt.passive.home <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_passSmokeHome.csv", sep = ";")
+dt.passive.work <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_passSmokeWork.csv", sep = ";")
+
+dt.pfas$passive.smoking.home <- NA
+dt.pfas$passive.smoking.work <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas)[i])]
+    
+  # passive smoking in the home environment 
+  fromYear.home <- NA
+  toYear.home <- NA  
+  if(is.na(dt.lifestyle$passSmokeHome[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$passive.smoking.home[i] <- NA
+  }else if(dt.lifestyle$passSmokeHome[which(dt.lifestyle$EIMS == eims.id)] == 1){
+     dt.pfas$passive.smoking.home[i] <- 0 
+  }else{
+      smoking <- dt.passive.home[which(dt.passive.home$EIMS == eims.id),]
+      if(!is.na(min(smoking$fromYear))){
+        sample.coll.year <- eims.metadata$year[which(eims.metadata$EIMS_ID == eims.id)]
+        if(is.na(dt.pfas$index.date[i])){
+          dt.pfas$passive.smoking.home[i] <- NA
+        }else if(as.numeric(min(smoking$fromYear)) <= as.numeric(format(as.Date(dt.pfas$index.date[i]), "%Y"))){
+          if(is.na(max(smoking$toYear))){
+            dt.pfas$passive.smoking.home[i] <- 1
+          }else if(max(smoking$toYear) >= as.numeric(format(as.Date(dt.pfas$index.date[i]), "%Y"))){
+            dt.pfas$passive.smoking.home[i] <- 1
+          }else{
+            dt.pfas$passive.smoking.home[i] <- 0
+          }
+        }else{
+          dt.pfas$passive.smoking.home[i] <- 0
+        }
+      }else{
+        dt.pfas$passive.smoking.home[i] <- NA
+      }
+  }
+
+  # Passive smoking in the working environment
+  fromYear.work <- NA
+  toYear.work <- NA    
+  if(is.na(dt.lifestyle$passSmokeWork[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$passive.smoking.work[i] <- NA
+  }else if(dt.lifestyle$passSmokeWork[which(dt.lifestyle$EIMS == eims.id)] == 1){
+     dt.pfas$passive.smoking.work[i] <- 0 
+  }else{
+      smoking <- dt.passive.work[which(dt.passive.work$EIMS == eims.id),]
+      if(!is.na(min(smoking$fromYear))){
+        sample.coll.year <- eims.metadata$year[which(eims.metadata$EIMS_ID == eims.id)]
+        if(is.na(dt.pfas$index.date[i])){
+          dt.pfas$passive.smoking.work[i] <- NA
+        }else if(as.numeric(min(smoking$fromYear)) <= as.numeric(format(as.Date(dt.pfas$index.date[i]), "%Y"))){
+          if(is.na(max(smoking$toYear))){
+            dt.pfas$passive.smoking.work[i] <- 1
+          }else if(max(smoking$toYear) >= as.numeric(format(as.Date(dt.pfas$index.date[i]), "%Y"))){
+            dt.pfas$passive.smoking.work[i] <- 1
+          }else{
+            dt.pfas$passive.smoking.work[i] <- 0
+          }
+        }else{
+          dt.pfas$passive.smoking.work[i] <- 0
+        }
+      }else{
+        dt.pfas$passive.smoking.work[i] <- NA
+      }
+  }
+}
+
+dt.pfas$passive.smoking <- NA
+for(i in 1:nrow(dt.pfas)){
+  if(is.na(dt.pfas$passive.smoking.work[i])){
+    dt.pfas$passive.smoking[i] <- dt.pfas$passive.smoking.home[i]
+  }else if(!is.na(dt.pfas$passive.smoking.work[i]) & !is.na(dt.pfas$passive.smoking.home[i])){
+    if(dt.pfas$passive.smoking.home[i] == 0 & dt.pfas$passive.smoking.work[i] != 1){
+      dt.pfas$passive.smoking[i] <- 0
+    }else if(dt.pfas$passive.smoking.home[i] == 1){
+      dt.pfas$passive.smoking[i] <- 1
+    }
+  }
+  
+  if(is.na(dt.pfas$passive.smoking.home[i])){
+    dt.pfas$passive.smoking[i] <- dt.pfas$passive.smoking.work[i]
+  } else if(!is.na(dt.pfas$passive.smoking.home[i]) & !is.na(dt.pfas$passive.smoking.work[i])){
+      if(dt.pfas$passive.smoking.work[i] == 0 & dt.pfas$passive.smoking.home[i] != 1){
+        dt.pfas$passive.smoking[i] <- 0
+      }else if(dt.pfas$passive.smoking.work[i] == 1){
+        dt.pfas$passive.smoking[i] <- 1
+      }
+    }
+  
+}
+dt.pfas$passive.smoking <- relevel(as.factor(dt.pfas$passive.smoking), ref = "0")
+rm(dt.passive.home, dt.passive.work)
+
+# Include Swedish snuff
+dt.snus <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/documents_20230619/EIMS_metabolomics_Snus.csv", sep = ";")
+
+dt.pfas$snuff <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$Snus[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$snuff[i] <- NA
+  }else if(dt.lifestyle$Snus[which(dt.lifestyle$EIMS == eims.id)] == 1){
+      dt.pfas$snuff[i] <- 0
+  }else{ 
+      snus <- dt.snus[which(dt.snus$EIMS == eims.id),]  
+      start.snus.age <- min(dt.snus$fromAge)
+      if(!is.na(start.snus.age)){
+        sample.coll.year <- eims.metadata$year[which(eims.metadata$EIMS_ID == eims.id)]
+        start.snus.year <- sample.coll.year - (dt.pfas$Age[i] - start.snus.age)
+        if(is.na(dt.pfas$index.date[i])){
+          dt.pfas$snuff[i] <- NA
+        }else if(as.numeric(start.snus.year) <= as.numeric(format(as.Date(dt.pfas$index.date[i]), "%Y"))){
+          end.snus.age <- max(dt.snus$toAge)
+          if(is.na(end.snus.age)){
+            dt.pfas$snuff[i] <- 1
+          }else if(end.snus.age >= dt.pfas$Age[i]){
+            dt.pfas$snuff[i] <- 1
+          }else{
+            dt.pfas$snuff[i] <- 0
+          }
+        }else{
+          dt.pfas$snuff[i] <- 0
+        }
+      }else{
+        dt.pfas$snuff[i] <- NA
+      }
+  }
+}                    
+
+dt.pfas$snuff <- as.factor(dt.pfas$snuff)
+rm(dt.snus)
+
+# Include tratment
+dt.drugs <- read.csv("/Users/ainva234/Documents/Project/EIMS/Data/SMSRegData/terapi.csv", sep=";")
+drug.classification <- read_excel("/Users/ainva234/Documents/Project/EIMS/Data/SMSRegData/drug_classification_V2.xlsx")
+
+# Inlcude mono
+dt.pfas$mono <- NA
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$infMono[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$mono[i] <- NA
+  }else if(dt.lifestyle$infMono[which(dt.lifestyle$EIMS == eims.id)] == 1){
+      dt.pfas$mono[i] <- 0
+  }else{ 
+      dt.pfas$mono[i] <- 1
+  }
+} 
+dt.pfas$mono <- relevel(as.factor(dt.pfas$mono), ref = "0")
+
+# Include cl alcohol consumed passed week and if the alcohol consumption has changed comapred to 5 years ago
+dt.pfas$cl.alcohol <- NA
+dt.pfas$alcohol5Years <- NA
+
+dt.lifestyle$alcoholBeerQuant <- dt.lifestyle$alcoholBeerQuant*0.035/40
+dt.lifestyle$alcoholWineQuant <- dt.lifestyle$alcoholWineQuant*0.12/40
+dt.lifestyle$alcoholStrongWineQuant <- dt.lifestyle$alcoholStrongWineQuant*0.15/40
+dt.lifestyle$alcoholLiquorQuant <- dt.lifestyle$alcoholLiquorQuant
+
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  if(is.na(dt.lifestyle$alcohol12Months[which(dt.lifestyle$EIMS == eims.id)])){
+      dt.pfas$cl.alcohol[i] <- NA
+  }else if(dt.lifestyle$alcohol12Months[which(dt.lifestyle$EIMS == eims.id)] == 1){
+      dt.pfas$cl.alcohol[i] <- 0
+  }else{ 
+      dt.pfas$cl.alcohol[i] <- sum(dt.lifestyle[which(dt.lifestyle$EIMS == eims.id),c(30:33)], na.rm=T) 
+  }
+  dt.pfas$alcohol5Years[i] <- dt.lifestyle$alcohol5Year[which(dt.lifestyle$EIMS == eims.id)]
+} 
+
+dt.pfas$alcohol5Years <- as.factor(dt.pfas$alcohol5Years)
+
+# Include number of childbirths prior to sample colleciton
+dt.pfas$nr.children <- NA
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  dt.pfas$nr.children[i] <- dt.children$antalbarn[which(dt.children$EIMS == eims.id)]
+} 
+dt.pfas$nr.children[which(dt.pfas$Sex == 0)] <- 0
+dt.pfas$nr.children[which(is.na(dt.pfas$nr.children))] <- 0
+
+# Assumption regarding BMI
+## Patients in the span of 15 to 25 years are assumed to ahve the same BMI at 20 as the current BMI and vice versa
+dt.pfas$BMI_20[which(dt.pfas$Age %in% c(15:25) & is.na(dt.pfas$BMI_20))] <- dt.pfas$BMI_curr[which(dt.pfas$Age %in% c(15:25) & is.na(dt.pfas$BMI_20))]
+dt.pfas$BMI_curr[which(dt.pfas$Age %in% c(15:25) & is.na(dt.pfas$BMI_curr))] <- dt.pfas$BMI_20[which(dt.pfas$Age %in% c(15:25) & is.na(dt.pfas$BMI_curr))]
+
+# Include residential area
+dt.pfas.MS <- dt.pfas[which(dt.pfas$Type != "HC"),]
+for(i in unique(dt.pfas$pairID)){
+  if(length(which(dt.pfas.MS$pairID == i)) > 0){
+   dt.pfas$County[which(dt.pfas$pairID == i)] <- dt.pfas.MS$County[which(dt.pfas.MS$pairID == i)]
+  }
+}
+
+# Sun habits
+## Sum up the three questions regarding sun habits (min score = 3 and max score = 12)
+## Group in sun habits (low < 25% qutlie, medium and high > 75% quatile) based on controls sunhabits
+dt.pfas$sunhabit.score <- NA
+for (i in 1:nrow(dt.pfas)) {
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas )[i])]
+  dt.pfas$sunhabit.score[i] <- sum(c(dt.lifestyle$sunSolarium[which(dt.lifestyle$EIMS == eims.id)],
+                                     dt.lifestyle$sunTravel[which(dt.lifestyle$EIMS == eims.id)],
+                                     dt.lifestyle$sunTan[which(dt.lifestyle$EIMS == eims.id)]), na.rm=T)
+}
+low <- quantile(dt.pfas$sunhabit.score[which(dt.pfas$Type == "HC")], probs = c(0.25, 0.75))[1]
+high <- quantile(dt.pfas$sunhabit.score[which(dt.pfas$Type == "HC")], probs = c(0.25, 0.75))[2]
+
+dt.pfas$sunhabit[which(dt.pfas$sunhabit.score <= low)] <- "low"
+dt.pfas$sunhabit[which(dt.pfas$sunhabit.score >= high)] <- "high"
+dt.pfas$sunhabit[which(dt.pfas$sunhabit.score > low & dt.pfas$sunhabit.score < high)] <- "medium"
+
+dt.pfas$sunhabit <- relevel(as.factor(dt.pfas$sunhabit), ref = "low")
+
+# Born in Sweden and other nordic countries
+born.country <- read_excel("/Users/ainva234/Documents/Project/EIMS/Data/survey_data/Ancestry.xls")
+dt.pfas$Swedish <- NA
+dt.pfas$Nordic <- NA
+for(i in 1:nrow(dt.pfas)){
+  eims.id <- eims.metadata$EIMS_ID[which(eims.metadata$eims_filename == rownames(dt.pfas)[i])]
+  dt.pfas$Swedish[i] <- born.country$swedish[which(born.country$EIMS == eims.id)]
+  dt.pfas$Nordic[i] <- born.country$nordic[which(born.country$EIMS == eims.id)]
+}
+dt.pfas$Swedish <- as.factor(dt.pfas$Swedish)
+dt.pfas$Nordic <- as.factor(dt.pfas$Nordic)
+```
+
+# Logistic regression
+Is PFAS exposure a risk factor for developing MS
+
+```{r set status (1/0)}
+#Set disease status, 1 for individuals with MS and 0 for controls
+dt.pfas$status <- 1 
+dt.pfas$status[which(dt.pfas$Type == "HC")] <- 0
+dt.pfas$status <- relevel(as.factor(dt.pfas$status), ref = "0")
+dt.pfas$Sex <- relevel(as.factor(dt.pfas$Sex), ref = "0")
+```
+
+## Base model
+```{r Males and Females}
+covariate.table <- matrix(NA, nrow = 20, ncol = 9)
+rownames(covariate.table) <- colnames(dt.pfas)[1:20]
+colnames(covariate.table) <- c("Age - estimate", "Age - P",
+                               "Sex - estimate", "Sex - P",
+                               "Current BMI - estimate", "Current BMI - P",
+                               "BMI at 20 - estimate", "BMI at 20 - P",
+                               "Week - P")
+
+summary.PFAS <- matrix(NA, nrow = 20, ncol = 3)
+colnames(summary.PFAS) <- c("OR", "CI 95%", "P-value")
+rownames(summary.PFAS) <- colnames(dt.pfas)[1:20]
+
+for(i in 1:20){
+  temp <- dt.pfas %>% dplyr::select(append(colnames(dt.pfas)[i], c("Age", "Sex", "BMI_curr", "BMI_20", "Week", "status", "County")))
+  names(temp)[1] <- "envCont"
+  mdl <- glmer(status ~ envCont + Age + Sex + BMI_curr + BMI_20 + Week + (1|County), data = temp, family = binomial(link='logit'))
+  
+  # Odds ratios, 95% CI, and p-values for all covariates in the model
+  conf.int <- Confint(mdl, exponentiate = TRUE)
+  summary.mdl <- S(mdl, exponentiate = T)
+  mdl.summary <- cbind(round(exp(summary(mdl)$coefficients[2:7,1]), digits = 3),
+                       cbind(paste(round(exp(conf.int)[3:8,1], digits = 3), "-", round(exp(conf.int)[3:8,2], digits = 3)),  
+                             round(summary.mdl$coefficients[2:7,4], digits =3)))
+  colnames(mdl.summary) <- c("OR", "CI 95%", "P-value")
+  
+  # PFAS/OH-PCBs OR, 95%CI, and p-value
+  summary.PFAS[i,] <- c(round(exp(summary(mdl)$coefficients[2]), digits = 3),
+                       paste(round(exp(conf.int)[3,1], digits = 3), "-", round(exp(conf.int)[3,2], digits = 3)), 
+                       round(coef(summary(mdl))[2,4], digits =3))
+  
+  # Covariates estimates and Anova p-values
+  covariate.table[i,c(1,3,5,7)] <- format(signif(summary(mdl)$coefficients[3:6], digits = 3), scientific = T)
+  covariate.table[i,c(2,4,6,8:9)] <- format(signif(Anova(mdl)[2:6,3], digits = 3), scientific = T)
+}
+
+write.csv(summary.PFAS, file = paste0(params$resultDir, "LogisticRegression/BaseModel/summary.compounds.csv"))
+write.csv(covariate.table, file = paste0(params$resultDir, "LogisticRegression/BaseModel/covariates.csv"))
+```
+
+### Divided by Sex
+```{r  Males, message=FALSE}
+covariate.table <- matrix(NA, nrow = 20, ncol = 7)
+rownames(covariate.table) <- colnames(dt.pfas)[1:20]
+colnames(covariate.table) <- c("Age - estimate", "Age - P",
+                               "Current BMI - estimate", "Current BMI - P",
+                               "BMI at 20 - estimate", "BMI at 20 - P",
+                               "Week - P")
+
+summary.PFAS <- matrix(NA, nrow = 20, ncol = 3)
+colnames(summary.PFAS) <- c("OR", "CI 95%", "P-value")
+rownames(summary.PFAS) <- colnames(dt.pfas)[1:20]
+
+for(i in 1:20){
+  temp <- dt.pfas %>% dplyr::select(append(colnames(dt.pfas)[i], c("Age", "Sex", "BMI_curr", "BMI_20", "Week", "status")))
+  
+  temp <- temp[which(temp$Sex == 0),] # Select only males
+  names(temp)[1] <- "envCont"
+  mdl <- glm(status ~ envCont + Age + BMI_curr + BMI_20 + Week, 
+             data = temp, 
+             family = binomial)
+  
+  # Odds ratios, 95% CI, and p-values for all covariates in the model
+  conf.int <- Confint(mdl, exponentiate = TRUE)
+  summary.mdl <- S(mdl,exponentiate = T)
+  mdl.summary <- cbind(round(conf.int[2:nrow(conf.int),1], digits = 3),
+                           cbind(paste(round(conf.int[2:nrow(conf.int),2], digits = 3), "-", round(conf.int[2:nrow(conf.int),3], digits = 3)),
+                                 signif(summary.mdl$coefficients[2:nrow(conf.int),4], digits =3)))
+  colnames(mdl.summary) <- c("OR", "CI 95%", "P-value")
+
+  # PFAS/OH-PCBs OR, 95%CI, and p-value
+  summary.PFAS[i,] <- mdl.summary[1,]
+  
+  # Covariate estimates and Anova p-values
+  covariate.table[i,c(1,3,5)] <- format(signif(summary(mdl)$coefficients[3:5], digits = 3), scientific = T)
+  covariate.table[i,c(2,4,6:7)] <- format(signif(Anova(mdl)[2:5,3], digits = 3), scientific = T)
+}
+
+write.csv(summary.PFAS, file = paste0(params$resultDir, "LogisticRegression/BaseModel/Males/summary.compounds.csv"))
+write.csv(covariate.table, file = paste0(params$resultDir, "LogisticRegression/BaseModel/Males/covariates.csv"))
+```
+
+```{r  Females, message=FALSE}
+covariate.table <- matrix(NA, nrow = 20, ncol = 7)
+rownames(covariate.table) <- colnames(dt.pfas)[1:20]
+colnames(covariate.table) <- c("Age - estimate", "Age - P",
+                               "Current BMI - estimate", "Current BMI - P",
+                               "BMI at 20 - estimate", "BMI at 20 - P",
+                               "Week - P")
+
+summary.PFAS <- matrix(NA, nrow = 20, ncol = 3)
+colnames(summary.PFAS) <- c("OR", "CI 95%", "P-value")
+rownames(summary.PFAS) <- colnames(dt.pfas)[1:20]
+
+for(i in 1:20){
+  temp <- dt.pfas %>% dplyr::select(append(colnames(dt.pfas)[i], c("Age", "Sex", "BMI_curr", "BMI_20", "Week", "status")))
+  
+  temp <- temp[which(temp$Sex == 1),] # Select only females
+  names(temp)[1] <- "envCont"
+  mdl <- glm(status ~ envCont + Age + BMI_curr + BMI_20 + Week, 
+             data = temp, 
+             family = binomial)
+  
+  # Odds ratios, 95% CI, and p-values for all covariates in the model
+  conf.int <- Confint(mdl, exponentiate = TRUE)
+  summary.mdl <- S(mdl,exponentiate = T)
+  mdl.summary <- cbind(round(conf.int[2:nrow(conf.int),1], digits = 3),
+                           cbind(paste(round(conf.int[2:nrow(conf.int),2], digits = 3), "-", round(conf.int[2:nrow(conf.int),3], digits = 3)),
+                                 signif(summary.mdl$coefficients[2:nrow(conf.int),4], digits =3)))
+  colnames(mdl.summary) <- c("OR", "CI 95%", "P-value")
+
+  # PFAS/OH-PCBs OR, 95%CI, and p-value
+  summary.PFAS[i,] <- mdl.summary[1,]
+  
+  # Covariate estimates and Anova p-values
+  covariate.table[i,c(1,3,5)] <- format(signif(summary(mdl)$coefficients[3:5], digits = 3), scientific = T)
+  covariate.table[i,c(2,4,6:7)] <- format(signif(Anova(mdl)[2:5,3], digits = 3), scientific = T)
+}
+
+write.csv(summary.PFAS, file = paste0(params$resultDir, "LogisticRegression/BaseModel/Females/summary.compounds.csv"))
+write.csv(covariate.table, file = paste0(params$resultDir, "LogisticRegression/BaseModel/Females/covariates.csv"))
+```
+
+## Final model
+```{r Males and Females, message=FALSE}
+covariate.table <- matrix(NA, nrow = 20, ncol = 22)
+rownames(covariate.table) <- colnames(dt.pfas)[1:20]
+colnames(covariate.table) <- c("Age - estimate", "Age - P",
+                               "Sex - estimate", "Sex - P",
+                               "Current BMI - estimate", "Current BMI - P",
+                               "BMI at 20 - estimate", "BMI at 20 - P",
+                               "Regular smoking - estimate", "Regular smoking - P",
+                               "Irregular smoking - estimate", "Irregular smoking - P",
+                               "Number of children - estimate", "Number of children - P",
+                               "History of infectious mononucleosis - estimate", "History of infectious mononucleosis - P",
+                               "Sunhabit (high) - estimate", "Sunhabit (medium) - estimate", "Sunhabit - P",
+                               "Swedish born - estimate", "Swedish born - P",
+                               "Week - P")
+
+summary.PFAS <- matrix(NA, nrow = 20, ncol = 3)
+colnames(summary.PFAS) <- c("OR", "CI 95%", "P-value")
+rownames(summary.PFAS) <- colnames(dt.pfas)[1:20]
+
+for(i in 1:20){
+  temp <- dt.pfas %>% dplyr::select(append(colnames(dt.pfas)[i], c("Age", "Sex", "BMI_curr", "BMI_20", "Week", "status",
+                                                                   "reg.smoking", "irreg.smoking", "nr.children",
+                                                                   "mono", "County", "sunhabit", "Swedish")))
+  names(temp)[1] <- "envCont"
+  mdl <- glmer(status ~ envCont + Age + Sex + BMI_curr + BMI_20 + reg.smoking + irreg.smoking + nr.children + mono + sunhabit  + Swedish + Week + (1|County), 
+             data = temp, 
+             family = binomial)
+  
+  # Odds ratios, 95% CI, and p-values for all covariates
+  conf.int <- Confint(mdl, exponentiate = TRUE)
+  summary.mdl <- S(mdl, exponentiate = T)
+  mdl.summary <- cbind(round(conf.int[2:nrow(conf.int),1], digits = 3),
+                           cbind(paste(round(conf.int[2:nrow(conf.int),2], digits = 3), "-", round(conf.int[2:nrow(conf.int),3], digits = 3)),
+                                 signif(summary.mdl$fixed.effects[2:nrow(conf.int),4], digits =3)))
+  colnames(mdl.summary) <- c("OR", "CI 95%", "P-value")
+
+  # PFAS/OH-PCBs odds ratios, 95% CI, and p-values
+  summary.PFAS[i,] <- mdl.summary[1,]
+  
+  # Covariate estimates and Anova p-values
+  covariate.table[i,c(1,3,5,7,9,11,13,15,17,18,20)] <- format(signif(summary(mdl)$coefficients[3:13], digits = 3), scientific = T)
+  covariate.table[i,c(2,4,6,8,10,12,14,16,19,21,22)] <- format(signif(Anova(mdl)[2:12,3], digits = 3), scientific = T)
+}
+
+write.csv(summary.PFAS, file = paste0(params$resultDir, "LogisticRegression/FinalModel/summary.compounds.csv"))
+write.csv(covariate.table, file = paste0(params$resultDir, "LogisticRegression/FinalModel/covariates.csv"))
+```
+### Divided by sex
+```{r Males, message=FALSE}
+covariate.table <- matrix(NA, nrow = 20, ncol = 18)
+rownames(covariate.table) <- colnames(dt.pfas)[1:20]
+colnames(covariate.table) <- c("Age - estimate", "Age - P",
+                               "Current BMI - estimate", "Current BMI - P",
+                               "BMI at 20 - estimate", "BMI at 20 - P",
+                               "Regular smoking - estimate", "Regular smoking - P",
+                               "Irregular smoking - estimate", "Irregular smoking - P",
+                               "History of infectious mononucleosis - estimate", "History of infectious mononucleosis - P",
+                               "Sunhabit (high) - estimate", "Sunhabit (medium) - estimate", "Sunhabit - P",
+                               "Swedish born - estimate", "Swedish born - P",
+                               "Week - P")
+
+summary.PFAS <- matrix(NA, nrow = 20, ncol = 3)
+colnames(summary.PFAS) <- c("OR", "CI 95%", "P-value")
+rownames(summary.PFAS) <- colnames(dt.pfas)[1:20]
+
+for(i in 1:20){
+  temp <- dt.pfas %>% dplyr::select(append(colnames(dt.pfas)[i], c("Age","BMI_curr", "BMI_20", "Week", "status",
+                                                                   "reg.smoking", "irreg.smoking", 
+                                                                   "mono", "County", "sunhabit", "Swedish")))
+  temp <- temp[which(temp$Sex == 0),] # Select only males
+  names(temp)[1] <- "envCont"
+  mdl <- glmer(status ~ envCont + Age + BMI_curr + BMI_20 + reg.smoking + irreg.smoking + mono + sunhabit  + Swedish + Week + (1|County), 
+             data = temp, 
+             family = binomial)
+  
+  # Odds ratios, 95% CI, and p-values for all covariates
+  conf.int <- Confint(mdl, exponentiate = TRUE)
+  summary.mdl <- S(mdl, exponentiate = T)
+  mdl.summary <- cbind(round(conf.int[2:nrow(conf.int),1], digits = 3),
+                           cbind(paste(round(conf.int[2:nrow(conf.int),2], digits = 3), "-", round(conf.int[2:nrow(conf.int),3], digits = 3)),
+                                 signif(summary.mdl$fixed.effects[2:nrow(conf.int),4], digits =3)))
+  colnames(mdl.summary) <- c("OR", "CI 95%", "P-value")
+
+  # PFAS/OH-PCBs odds ratios, 95% CI, and p-values
+  summary.PFAS[i,] <- mdl.summary[1,]
+  
+  # Covariate estimates and Anova p-values
+  covariate.table[i,c(1,3,5,7,9,11,13,14,16)] <- format(signif(summary(mdl)$coefficients[3:11], digits = 3), scientific = T)
+  covariate.table[i,c(2,4,6,8,10,12,15,17,18)] <- format(signif(Anova(mdl)[2:10,3], digits = 3), scientific = T)
+}
+
+write.csv(summary.PFAS, file = paste0(params$resultDir, "LogisticRegression/FinalModel/Males/summary.compounds.csv"))
+write.csv(covariate.table, file = paste0(params$resultDir, "LogisticRegression/FinalModel/Males/covariates.csv"))
+```
+
+```{r Females, message=FALSE}
+covariate.table <- matrix(NA, nrow = 20, ncol = 20)
+rownames(covariate.table) <- colnames(dt.pfas)[1:20]
+colnames(covariate.table) <- c("Age - estimate", "Age - P",
+                               "Current BMI - estimate", "Current BMI - P",
+                               "BMI at 20 - estimate", "BMI at 20 - P",
+                               "Regular smoking - estimate", "Regular smoking - P",
+                               "Irregular smoking - estimate", "Irregular smoking - P",
+                               "Number of children - estimate", "Number of children - P",
+                               "History of infectious mononucleosis - estimate", "History of infectious mononucleosis - P",
+                               "Sunhabit (high) - estimate", "Sunhabit (medium) - estimate", "Sunhabit - P",
+                               "Swedish born - estimate", "Swedish born - P",
+                               "Week - P")
+
+summary.PFAS <- matrix(NA, nrow = 20, ncol = 3)
+colnames(summary.PFAS) <- c("OR", "CI 95%", "P-value")
+rownames(summary.PFAS) <- colnames(dt.pfas)[1:20]
+
+for(i in 1:20){
+  temp <- dt.pfas %>% dplyr::select(append(colnames(dt.pfas)[i], c("Age", "BMI_curr", "BMI_20", "Week", "status",
+                                                                   "reg.smoking", "irreg.smoking", "nr.children",
+                                                                   "mono", "County", "sunhabit", "Swedish")))
+  temp <- temp[which(temp$Sex == 1),] # Select only females
+  names(temp)[1] <- "envCont"
+  mdl <- glmer(status ~ envCont + Age + BMI_curr + BMI_20 + reg.smoking + irreg.smoking + nr.children + mono + sunhabit  + Swedish + Week + (1|County), 
+             data = temp, 
+             family = binomial)
+  
+  # Odds ratios, 95% CI, and p-values for all covariates
+  conf.int <- Confint(mdl, exponentiate = TRUE)
+  summary.mdl <- S(mdl, exponentiate = T)
+  mdl.summary <- cbind(round(conf.int[2:nrow(conf.int),1], digits = 3),
+                           cbind(paste(round(conf.int[2:nrow(conf.int),2], digits = 3), "-", round(conf.int[2:nrow(conf.int),3], digits = 3)),
+                                 signif(summary.mdl$fixed.effects[2:nrow(conf.int),4], digits =3)))
+  colnames(mdl.summary) <- c("OR", "CI 95%", "P-value")
+
+  # PFAS/OH-PCBs odds ratios, 95% CI, and p-values
+  summary.PFAS[i,] <- mdl.summary[1,]
+  
+  # Covariate estimates and Anova p-values
+  covariate.table[i,c(1,3,5,7,9,11,13,15,16,18)] <- format(signif(summary(mdl)$coefficients[3:12], digits = 3), scientific = T)
+  covariate.table[i,c(2,4,6,8,10,12,14,17,19,20)] <- format(signif(Anova(mdl)[2:11,3], digits = 3), scientific = T)
+}
+
+write.csv(summary.PFAS, file = paste0(params$resultDir, "LogisticRegression/FinalModel/Females/summary.compounds.csv"))
+write.csv(covariate.table, file = paste0(params$resultDir, "LogisticRegression/FinalModel/Females/covariates.csv"))
+```
